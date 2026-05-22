@@ -1,0 +1,46 @@
+Sort Memories — Source-Available License
+Copyright (c) 2026 Eliott Bouquerel. All Rights Reserved.
+
+This source code is made publicly visible for transparency and educational
+reference only. It is NOT open-source software.
+
+The following actions are PROHIBITED without prior written permission from
+the copyright holder:
+
+  1. Redistribution of the source code or any derivative works, in whole or
+     in part, in any form.
+
+  2. Modification of the source code for distribution.
+
+  3. Commercial use of the source code or any derivative works, including
+     but not limited to:
+       - Reselling, sublicensing, or relicensing the software
+       - Integrating the source code into commercial products or services
+       - Hosting the software as a service (SaaS) for third parties
+
+  4. Removal or alteration of the licensing system, license verification
+     mechanism, or trial limits embedded in the software.
+
+  5. Use of the "Sort Memories" name, logo, or branding to promote derivative
+     works without explicit permission.
+
+PERMITTED:
+
+  - Reading the source code for personal study, security review, or
+    educational purposes.
+  - Running compiled binaries downloaded from official channels
+    (GitHub Releases, https://github.com/Lyot7/sort-memories/releases) under
+    the terms of the embedded license / trial system.
+  - Reporting security vulnerabilities or bugs via GitHub Issues.
+  - Submitting pull requests with bug fixes or improvements; merged
+    contributions are licensed to the copyright holder under the same terms.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For licensing inquiries: contact the copyright holder via GitHub
+(https://github.com/Lyot7).

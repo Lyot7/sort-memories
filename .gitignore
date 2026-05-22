@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# PyInstaller build artifacts
+dist/
+build/*.spec.bak
+build/__pycache__/
+*.manifest
+*.spec.bak
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Application runtime state (per-user, never commit)
+license.json
+triage_state.json
+dedupe_cache.json
+dedupe_groups.json
+clip_embeddings.npy
+clip_index.json
+clip_groups.json
+_a_supprimer/
+
+# Env (Next.js convention — applicable here too)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# OS / editor scratch
+*.tmp
+*.bak

@@ -1,0 +1,49 @@
+[project]
+name = "sort-memories"
+version = "0.1.0"
+description = "Desktop app to sort and dedupe local media folders (macOS, soon multi-platform)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Eliott Bouquerel" }]
+keywords = ["media", "sort", "dedupe", "photo", "video", "macos", "desktop", "clip", "phash"]
+
+dependencies = [
+    "flask>=3.0",
+    "pillow>=10.0",
+    "imagehash>=4.3",
+    "numpy>=1.26",
+    "torch>=2.2",
+    "open-clip-torch>=2.24",
+    "pywebview>=5.0",
+    "appdirs>=1.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.5",
+    "ruff>=0.4",
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lyot7/sort-memories"
+Repository = "https://github.com/Lyot7/sort-memories"
+Issues = "https://github.com/Lyot7/sort-memories/issues"
+
+[project.scripts]
+sort-memories = "sort_memories.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sort_memories*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
