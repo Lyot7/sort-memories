@@ -2,7 +2,7 @@
 
 > Application desktop pour trier et dédoublonner les dossiers de médias locaux. Reprenez le contrôle de votre stockage.
 
-![Status](https://img.shields.io/badge/status-WIP-orange) ![Platform](https://img.shields.io/badge/platform-macOS-black) ![License](https://img.shields.io/badge/license-source--available-blue)
+![Status](https://img.shields.io/badge/status-alpha-yellow) ![Platform](https://img.shields.io/badge/platform-macOS-black) ![License](https://img.shields.io/badge/license-source--available-blue) [![Download](https://img.shields.io/github/v/release/Lyot7/sort-memories?label=download&color=brightgreen)](https://github.com/Lyot7/sort-memories/releases/latest)
 
 ## Pitch
 
@@ -21,11 +21,21 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 
 ## Installation
 
-> macOS 13+ requis. Multi-plateforme (Linux/Windows) prévu après commercialisation.
+> macOS 12+ requis (Apple Silicon ou Intel). Multi-plateforme (Linux/Windows) prévu après commercialisation.
 
-**Téléchargement direct** : [dernière release](https://github.com/Lyot7/sort-memories/releases/latest) → `SortMemories.dmg` → glisser dans `/Applications`.
+**Téléchargement direct** : [dernière release](https://github.com/Lyot7/sort-memories/releases/latest) → `SortMemories-macos-vX.Y.Z.zip` → décompresse → glisse `Sort Memories.app` dans `/Applications`.
 
-L'app est signée Apple Developer ID et notarisée — pas de "App non vérifiée" au premier lancement.
+### ⚠️ Première ouverture sur macOS (v0.1.x — non encore notarisée)
+
+La v0.1.x n'est pas encore signée Apple Developer ID. macOS Gatekeeper va afficher *"Sort Memories ne peut pas être ouvert car le développeur n'est pas vérifié"* au premier lancement. Pour l'ouvrir :
+
+1. **Clic droit** sur `Sort Memories.app` dans `/Applications` → **Ouvrir**
+2. Re-clic sur **Ouvrir** dans la popup
+3. macOS retient ton choix — les lancements suivants se font normalement
+
+Alternative : `Réglages Système` → `Confidentialité et sécurité` → scroller → `"Sort Memories a été bloquée…"` → **Ouvrir quand même**.
+
+Signature + notarisation Apple arrivent en v0.2.0.
 
 ## Tarification
 
@@ -34,18 +44,23 @@ L'app est signée Apple Developer ID et notarisée — pas de "App non vérifié
 
 ## Quick start
 
-1. Lance Sort Memories
-2. Sélectionne le dossier à trier (ex : `~/Pictures/Snapchat`)
-3. Attends le scan initial (pHash + CLIP, ~30 s pour 1000 fichiers sur Apple Silicon)
+1. Lance **Sort Memories** (cf. note Gatekeeper ci-dessus au premier lancement)
+2. Sélectionne le dossier à trier (ex : `~/Pictures/Snapchat`, un dossier de captures, etc.)
+3. Lance le scan de doublons via le bouton ↻ dans l'UI (pHash, ~5 ms/image)
 4. Tri au clavier : `→` garder, `←` retour, `D` supprimer, `O` overlay
-5. À la fin : vide `_a_supprimer/` dans la corbeille macOS
+5. Les fichiers gardés sont rangés dans `<dossier>/Gardés/<année>/`
+6. Les fichiers à virer atterrissent dans `<dossier>/_a_supprimer/` — videz-le dans la corbeille macOS quand tout est trié
+
+**Note v0.1.0** : la recherche sémantique CLIP n'est PAS bundlée (gain de 2 GB sur le téléchargement). Elle arrivera en v0.2.0 — soit en bundle complet, soit téléchargée à la demande. La détection de doublons pHash, elle, est entièrement fonctionnelle.
 
 ## Roadmap
 
 - [x] Prototype Flask + UI web (utilisé en interne pour trier le dossier Snapchat de l'auteur)
-- [ ] Wrapper pywebview → `.app` macOS natif
-- [ ] Signature + notarisation Apple
-- [ ] CI/CD GitHub Actions (build .dmg sur tag)
+- [x] Wrapper pywebview → `.app` macOS natif (v0.1.0)
+- [x] Build PyInstaller + release GitHub (v0.1.0)
+- [ ] Recherche sémantique CLIP bundlée ou downloadable on-demand (v0.2.0)
+- [ ] Signature + notarisation Apple (Developer ID) (v0.2.0)
+- [ ] CI/CD GitHub Actions (build .dmg sur tag, runner macos-14)
 - [ ] Backend de licence (vérification clé en ligne, grace period 30j)
 - [ ] Landing page + screenshots/GIF démo
 - [ ] Port Linux / Windows (post-commercialisation)

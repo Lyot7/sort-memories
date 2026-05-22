@@ -14,6 +14,7 @@ pip-wheel-metadata/
 
 # PyInstaller build artifacts
 dist/
+build/work/
 build/*.spec.bak
 build/__pycache__/
 *.manifest
