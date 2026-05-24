@@ -12,12 +12,15 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 
 ## Fonctionnalités
 
+- 📁 **Écran d'accueil** : ajoute N dossiers source, choisis tes options, démarre — pas de Finder intrusif au lancement
+- 🗂️ **Options de tri combinables** : grouper par année / aussi par mois / séparer images-vidéos / renommer en `YYYY-MM-DD_<hash>.ext`
 - 🖼️ **Triage rapide** : flèches gauche/droite pour parcourir, `D` pour supprimer, `O` pour overlay
+- ↶ **Undo** : `←` revient en arrière sans perdre l'état (keep et delete réversibles)
 - 🔍 **Déduplication pHash** : détecte les copies exactes ou re-encodées (resize, conversion JPG↔PNG, etc.)
-- 🧠 **Recherche sémantique CLIP** : regroupe les images visuellement similaires (selfies, paysages, captures d'écran…)
 - 🎬 **Support vidéo** : extraction de frames pour détection de doublons MP4/MOV
 - 💾 **100% local** : aucun upload, aucune télémétrie, aucune dépendance cloud
-- ⏯️ **Reprise de session** : ferme et reprends quand tu veux, l'état est sauvegardé
+- ⏯️ **Reprise de session** : ferme et reprends quand tu veux, l'état est sauvegardé par config (sources × options)
+- 🔜 **Recherche sémantique CLIP** : prévue pour v0.3.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
 
 ## Installation
 

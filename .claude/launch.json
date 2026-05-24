@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Sort Memories — Flask UI (browser dev)",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "SORT_MEMORIES_MEDIA_DIR=/tmp/sort-memories-test .venv/bin/python -m sort_memories.core"],
+      "port": 7777
+    },
+    {
+      "name": "Sort Memories — Desktop app (pywebview + Flask)",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["app.py"],
+      "port": 7777
+    }
+  ]
+}

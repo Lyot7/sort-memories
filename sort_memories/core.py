@@ -61,6 +61,185 @@ VIDEO_MATCH    = 3    # frames minimum correspondantes sur VIDEO_FRAMES
 
 app = Flask(__name__)
 
+# ── Session configuration (v0.2.0) ────────────────────────────────────────────
+# Une "session" = N dossiers sources + options de tri. Persiste dans STATE_DIR.
+# Tant que `configured` est False, l'UI affiche la vue accueil et collect_files
+# retourne vide.
+
+SESSION_FILE = STATE_DIR / "session.json"
+IMAGE_EXT    = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+VIDEO_EXT    = {".mp4", ".mov"}
+
+DEFAULT_OPTIONS = {
+    "by_year":     True,
+    "by_month":    False,
+    "split_media": False,
+    "rename":      False,
+}
+
+# Pywebview window injectée par app.py via set_main_window() pour exposer le
+# folder picker natif à l'UI Flask via /api/pick_folder. None en dev browser.
+_main_window = None
+
+def set_main_window(window):
+    global _main_window
+    _main_window = window
+
+_session_config = {
+    "configured": False,
+    "sources":    [],            # list[str] — chemins absolus
+    "options":    dict(DEFAULT_OPTIONS),
+}
+
+def _save_session_config():
+    try:
+        SESSION_FILE.write_text(json.dumps(_session_config, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+def _load_session_config():
+    global _session_config
+    if SESSION_FILE.exists():
+        try:
+            data = json.loads(SESSION_FILE.read_text())
+            if data.get("configured"):
+                _session_config.update(data)
+                _session_config["options"] = {**DEFAULT_OPTIONS, **(data.get("options") or {})}
+                return
+        except Exception:
+            pass
+    # Fallback : si SORT_MEMORIES_MEDIA_DIR set explicitement → auto-config
+    if os.environ.get("SORT_MEMORIES_MEDIA_DIR"):
+        _session_config["configured"] = True
+        _session_config["sources"]    = [str(MEDIA_DIR)]
+        _session_config["options"]    = dict(DEFAULT_OPTIONS)
+
+def _is_configured() -> bool:
+    return bool(_session_config["configured"] and _session_config["sources"])
+
+def _sources() -> list:
+    return [Path(p) for p in _session_config["sources"]]
+
+def _opts() -> dict:
+    return _session_config["options"]
+
+def _make_entry(src_idx: int, rel: str) -> str:
+    """Encode (source_index, relative_path) → string JSON-safe."""
+    return f"{src_idx}::{rel}"
+
+def _parse_entry(entry: str):
+    """Décode "<idx>::<rel>" → (src_idx, rel). Legacy "<rel>" → (0, rel)."""
+    if "::" in entry:
+        idx_s, rel = entry.split("::", 1)
+        try:
+            return int(idx_s), rel
+        except ValueError:
+            return 0, entry
+    return 0, entry
+
+def _entry_source(entry: str) -> Path:
+    idx, _ = _parse_entry(entry)
+    srcs = _sources()
+    return srcs[idx] if 0 <= idx < len(srcs) else MEDIA_DIR
+
+def _entry_path(entry: str) -> Path:
+    idx, rel = _parse_entry(entry)
+    return _entry_source(entry) / rel
+
+def _entry_rel(entry: str) -> str:
+    """Retourne juste le chemin relatif à la source."""
+    _, rel = _parse_entry(entry)
+    return rel
+
+def _config_namespace() -> str:
+    """Hash court de la config (sources + options) pour namespacer le state."""
+    payload = json.dumps({
+        "sources": sorted(_session_config["sources"]),
+        "options": _session_config["options"],
+    }, sort_keys=True)
+    return _hashlib.sha1(payload.encode()).hexdigest()[:12]
+
+def _is_image(rel: str) -> bool:
+    return Path(rel).suffix.lower() in IMAGE_EXT
+
+def _is_video(rel: str) -> bool:
+    return Path(rel).suffix.lower() in VIDEO_EXT
+
+def compute_keep_destination(entry: str) -> Path:
+    """Calcule le chemin de destination pour un fichier 'gardé' selon les options.
+
+    Structure : <source>/Tri/Gardées/[images|videos/]/[YYYY/]/[MM/]/[renamed_]filename
+    """
+    src    = _entry_source(entry)
+    rel    = _entry_rel(entry)
+    opts   = _opts()
+    abs_p  = src / rel
+    parts  = [src, "Tri", "Gardées"]
+
+    if opts.get("split_media"):
+        if _is_image(rel):
+            parts.append("images")
+        elif _is_video(rel):
+            parts.append("videos")
+        else:
+            parts.append("autres")
+
+    if opts.get("by_year") or opts.get("by_month"):
+        import datetime
+        try:
+            mtime = abs_p.stat().st_mtime
+            dt    = datetime.datetime.fromtimestamp(mtime)
+            year  = str(dt.year)
+            month = f"{dt.month:02d}"
+            import re
+            m = re.match(r"^(\d{4})[-_](\d{2})", Path(rel).name)
+            if m:
+                year, month = m.group(1), m.group(2)
+            if opts.get("by_year"):
+                parts.append(year)
+            if opts.get("by_month"):
+                parts.append(month)
+        except Exception:
+            pass
+
+    if opts.get("rename"):
+        import datetime, re
+        try:
+            mtime = abs_p.stat().st_mtime
+            dt    = datetime.datetime.fromtimestamp(mtime)
+            stamp = dt.strftime("%Y-%m-%d")
+        except Exception:
+            stamp = "undated"
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", Path(rel).name)
+        if m:
+            stamp = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        short_hash = _hashlib.sha1(rel.encode()).hexdigest()[:8]
+        name = f"{stamp}_{short_hash}{Path(rel).suffix.lower()}"
+    else:
+        name = Path(rel).name
+
+    dst_dir = Path(*[str(p) for p in parts])
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / name
+    n = 1
+    while dst.exists():
+        dst = dst_dir / f"{Path(name).stem}_{n}{Path(name).suffix}"
+        n += 1
+    return dst
+
+def compute_trash_destination(entry: str) -> Path:
+    """Chemin de la corbeille pour un fichier supprimé : <source>/Tri/Supprimées/<name>."""
+    src     = _entry_source(entry)
+    rel     = _entry_rel(entry)
+    dst_dir = src / "Tri" / "Supprimées"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / Path(rel).name
+    n = 1
+    while dst.exists():
+        dst = dst_dir / f"{Path(rel).stem}_{n}{Path(rel).suffix}"
+        n += 1
+    return dst
+
 # ── Licence ───────────────────────────────────────────────────────────────────
 # v0.1.0 : paywall désactivé (open trial). Le code reste en place pour réactivation
 # future via la variable d'environnement SORT_MEMORIES_LICENSE_ENFORCE=1.
@@ -208,9 +387,45 @@ CLIP_LABEL_FR = {
     "an image":                             "Photos similaires",
 }
 
-def _init_mem():
-    """Charge tout en mémoire au démarrage. Appelé une seule fois."""
+def _rebind_state_paths():
+    """Re-pointe STATE_FILE, CACHE_FILE, etc. selon le namespace de la session courante."""
+    global STATE_FILE, CACHE_FILE, GROUPS_FILE, _NS_DIR
+    global CLIP_GROUPS_PATH, CLIP_EMB_PATH, CLIP_INDEX_PATH
+    if not _is_configured():
+        return
+    ns = _config_namespace()
+    _NS_DIR = STATE_DIR / "sessions" / ns
+    _NS_DIR.mkdir(parents=True, exist_ok=True)
+    # Trace humaine : quelles sources, quelles options
+    try:
+        (_NS_DIR / "config.json").write_text(json.dumps(_session_config, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+    STATE_FILE       = _NS_DIR / "triage_state.json"
+    CACHE_FILE       = _NS_DIR / "dedupe_cache.json"
+    GROUPS_FILE      = _NS_DIR / "dedupe_groups.json"
+    CLIP_GROUPS_PATH = _NS_DIR / "clip_groups.json"
+    CLIP_EMB_PATH    = _NS_DIR / "clip_embeddings.npy"
+    CLIP_INDEX_PATH  = _NS_DIR / "clip_index.json"
+
+def _reset_mem():
+    """Vide tous les caches mémoire (utilisé lors d'un /api/reset ou /api/config POST)."""
     global _mem_hash_cache, _mem_groups, _mem_file2group, _mem_state
+    global _mem_clip_groups, _mem_clip_file2group
+    _mem_hash_cache       = {}
+    _mem_groups           = {}
+    _mem_file2group       = {}
+    _mem_clip_groups      = {}
+    _mem_clip_file2group  = {}
+    _mem_state            = None
+
+def _init_mem():
+    """Charge tout en mémoire au démarrage. Appelé après /api/config ou au boot si déjà configuré."""
+    global _mem_hash_cache, _mem_groups, _mem_file2group, _mem_state
+    if not _is_configured():
+        _mem_state = {"files": [], "current": 0, "history": []}
+        return
+    _rebind_state_paths()
     # Hash cache
     if CACHE_FILE.exists():
         try:
@@ -356,19 +571,26 @@ def save_hash_cache(cache: dict):
     CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False))
 
 def all_scannable_files() -> list:
-    """Tous les médias sous MEDIA_DIR, à scanner pour pHash/CLIP (inclut Gardés/)."""
+    """Tous les médias sous les sources configurées, à scanner pour pHash."""
     result = []
-    skip_dirs = {TRASH_DIR.name}
-    for f in sorted(BASE.rglob("*")):
-        if not f.is_file():
+    skip_dirs = {"_a_supprimer", "Tri"}
+    for src in _sources():
+        if not src.exists():
             continue
-        if f.suffix.lower() not in MEDIA_EXT:
-            continue
-        if f.name.startswith(".") or f.name.endswith("-overlay.png"):
-            continue
-        if any(part in skip_dirs for part in f.relative_to(BASE).parts):
-            continue
-        result.append(f)
+        for f in sorted(src.rglob("*")):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in MEDIA_EXT:
+                continue
+            if f.name.startswith(".") or f.name.endswith("-overlay.png"):
+                continue
+            try:
+                rel_parts = f.relative_to(src).parts
+            except Exception:
+                continue
+            if any(part in skip_dirs for part in rel_parts):
+                continue
+            result.append(f)
     return result
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -493,7 +715,7 @@ def clip_group_label(centroid) -> tuple:
         return ("🖼", "Photos similaires")
 
 def clip_quality_score(rel: str, sharpness: float) -> float:
-    p   = BASE / rel
+    p   = _entry_path(rel)
     sz  = p.stat().st_size if p.exists() else 0
     ent = _mem_hash_cache.get(rel, {})
     res = ent.get("resolution")
@@ -721,57 +943,74 @@ def scan_clip():
 # EXISTING HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _year_label(rel: str) -> str:
-    """Heuristique année pour l'affichage et le rangement Gardés/<year>/.
+def _year_label(entry: str) -> str:
+    """Heuristique année pour l'affichage uniquement.
 
-    Ordre : (1) premier dossier si c'est 4 chiffres, (2) regex YYYY en début de filename
-    (Snapchat convention), (3) année du mtime du fichier, (4) "divers".
+    Ordre : (1) regex YYYY en début de filename (Snapchat convention),
+    (2) année du mtime du fichier, (3) "—".
     """
     import re
-    parts = Path(rel).parts
-    if parts and parts[0].isdigit() and len(parts[0]) == 4:
-        return parts[0]
-    m = re.match(r"^(\d{4})[-_]", Path(rel).name)
+    rel  = _entry_rel(entry)
+    name = Path(rel).name
+    m = re.match(r"^(\d{4})[-_]", name)
     if m:
         return m.group(1)
     try:
         import datetime
-        mtime = (BASE / rel).stat().st_mtime
+        mtime = _entry_path(entry).stat().st_mtime
         return str(datetime.datetime.fromtimestamp(mtime).year)
     except Exception:
-        return "divers"
+        return "—"
 
 
 def collect_files():
-    """Collecte tous les médias sous MEDIA_DIR (récursif).
+    """Collecte tous les médias sous toutes les sources configurées.
 
-    Exclusions :
-    - Fichiers cachés (.*)
-    - Dossier trash (_a_supprimer/) et dossier Gardés/ (résultat du triage précédent)
-    - Overlays Snapchat (*-overlay.png)
+    Retourne une liste d'entries "<src_idx>::<rel>" (cf. _make_entry).
+    Exclusions : fichiers cachés, dossier Tri/ (résultat), _a_supprimer/, overlays.
     """
+    if not _is_configured():
+        return []
     files = []
-    skip_dirs = {TRASH_DIR.name, "Gardés", "Gardes", ".DS_Store"}
-    for f in sorted(BASE.rglob("*")):
-        if not f.is_file():
+    skip_dirs = {"_a_supprimer", "Tri", "Gardés", "Gardes"}
+    for idx, src in enumerate(_sources()):
+        if not src.exists():
             continue
-        if f.suffix.lower() not in MEDIA_EXT:
-            continue
-        if f.name.startswith(".") or f.name.endswith("-overlay.png"):
-            continue
-        # Skip si dans un dossier exclus
-        if any(part in skip_dirs for part in f.relative_to(BASE).parts):
-            continue
-        files.append(str(f.relative_to(BASE)))
+        for f in sorted(src.rglob("*")):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in MEDIA_EXT:
+                continue
+            if f.name.startswith(".") or f.name.endswith("-overlay.png"):
+                continue
+            try:
+                rel_parts = f.relative_to(src).parts
+            except Exception:
+                continue
+            if any(part in skip_dirs for part in rel_parts):
+                continue
+            files.append(_make_entry(idx, str(f.relative_to(src))))
     return files
 
-def find_overlay(rel):
-    p    = BASE / rel
-    stem = p.stem
+def find_overlay(entry):
+    """Trouve l'overlay -overlay.png correspondant à un fichier -main.<ext>.
+
+    Retourne un entry "<src_idx>::<rel_overlay>" ou None.
+    """
+    src_idx, rel = _parse_entry(entry)
+    p     = _entry_path(entry)
+    stem  = p.stem
     if not stem.endswith("-main"):
         return None
     overlay = p.parent / f"{stem[:-5]}-overlay.png"
-    return str(overlay.relative_to(BASE)) if overlay.exists() else None
+    if not overlay.exists():
+        return None
+    source = _entry_source(entry)
+    try:
+        rel_ov = str(overlay.relative_to(source))
+    except ValueError:
+        return None
+    return _make_entry(src_idx, rel_ov)
 
 def merge_overlay(main_path: Path, overlay_path: Path):
     ext = main_path.suffix.lower()
@@ -806,51 +1045,40 @@ def merge_overlay(main_path: Path, overlay_path: Path):
             tmp.unlink(missing_ok=True)
             raise RuntimeError(result.stderr.decode()[-300:])
 
-def move_to_gardes(rel: str, overlay_rel: str = None, overlay_visible: bool = True) -> dict:
-    """
-    Déplace immédiatement un fichier vers Gardés/YYYY/.
+def move_to_gardes(entry: str, overlay_entry: str = None, overlay_visible: bool = True) -> dict:
+    """Déplace immédiatement un fichier vers <source>/Tri/Gardées/[options]/.
+
     Fusionne l'overlay si visible, le trash sinon.
-    Retourne un dict avec les chemins pour le undo.
+    Retourne un dict avec les chemins (absolus) pour permettre l'undo.
     """
-    src    = BASE / rel
-    year   = _year_label(rel)
-    dst_dir = BASE / "Gardés" / year
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / src.name
-    n   = 1
-    while dst.exists():
-        dst = dst_dir / f"{src.stem}_{n}{src.suffix}"
-        n  += 1
+    src = _entry_path(entry)
+    dst = compute_keep_destination(entry)
 
-    result = {"original": rel, "kept_path": str(dst.relative_to(BASE))}
+    result = {"original": entry, "kept_path": str(dst)}
 
-    if overlay_rel:
-        ov_src = BASE / overlay_rel
+    if overlay_entry:
+        ov_src = _entry_path(overlay_entry)
         if overlay_visible and ov_src.exists():
             try:
                 merge_overlay(src, ov_src)
                 ov_src.unlink()
-                result["overlay_merged"] = overlay_rel
+                result["overlay_merged"] = overlay_entry
             except Exception:
                 pass
         elif not overlay_visible and ov_src.exists():
-            odst = trash_file(overlay_rel)
-            result["overlay_trashed"]    = overlay_rel
+            odst = trash_file(overlay_entry)
+            result["overlay_trashed"]    = overlay_entry
             result["overlay_trash_path"] = odst
 
     shutil.move(str(src), str(dst))
     return result
 
-def trash_file(rel):
-    src = BASE / rel
+def trash_file(entry):
+    """Déplace un fichier vers <source>/Tri/Supprimées/. Retourne le chemin absolu de destination."""
+    src = _entry_path(entry)
     if not src.exists():
         return None
-    TRASH_DIR.mkdir(exist_ok=True)
-    dst = TRASH_DIR / src.name
-    n   = 1
-    while dst.exists():
-        dst = TRASH_DIR / f"{src.stem}_{n}{src.suffix}"
-        n  += 1
+    dst = compute_trash_destination(entry)
     shutil.move(str(src), str(dst))
     return str(dst)
 
@@ -919,6 +1147,14 @@ def api_clip_rescan():
 
 @app.route("/api/state")
 def api_state():
+    # Si aucune session configurée → UI affiche la vue accueil.
+    if not _is_configured():
+        return jsonify({
+            "mode":     "needs_config",
+            "done":     False,
+            "defaults": {"options": DEFAULT_OPTIONS},
+        })
+
     s          = load_state()
     idx, files = s["current"], s["files"]
 
@@ -927,7 +1163,7 @@ def api_state():
 
     # Sauter les fichiers absents du disque (déjà déplacés vers Gardés/ ou trashés)
     start_idx = idx
-    while idx < len(files) and not (BASE / files[idx]).exists():
+    while idx < len(files) and not _entry_path(files[idx]).exists():
         idx += 1
     if idx != start_idx:
         s["current"] = idx
@@ -961,17 +1197,19 @@ def api_state():
                 key=lambda r: quality_score(r, _mem_hash_cache.get(r, {})), reverse=True)
 
             def file_meta(r):
-                p     = BASE / r
-                entry = _mem_hash_cache.get(r, {})
-                res   = entry.get("resolution")
-                ov    = find_overlay(r)
+                p        = _entry_path(r)
+                rel_only = _entry_rel(r)
+                entry    = _mem_hash_cache.get(r, {})
+                res      = entry.get("resolution")
+                ov       = find_overlay(r)
                 return {
                     "rel":         r,
                     "url":         f"/media/{r}",
-                    "is_video":    Path(r).suffix.lower() in {".mp4", ".mov"},
+                    "is_video":    Path(rel_only).suffix.lower() in {".mp4", ".mov"},
                     "size_kb":     round(p.stat().st_size / 1024) if p.exists() else 0,
                     "resolution":  f"{res[0]}×{res[1]}" if res else "?",
-                    "date":        r.split("/")[-1].split("_")[0] if "/" in r else "?",
+                    "date":        _year_label(r),
+                    "name":        Path(rel_only).name,
                     "overlay_url": f"/media/{ov}" if ov else None,
                     "overlay_rel": ov,
                 }
@@ -996,7 +1234,7 @@ def api_state():
 
         if len(cg_in_queue) >= 2:
             def clip_file_meta(r):
-                p     = BASE / r
+                p     = _entry_path(r)
                 entry = _mem_hash_cache.get(r, {})
                 res   = entry.get("resolution")
                 ov    = find_overlay(r)
@@ -1025,20 +1263,26 @@ def api_state():
             })
 
     # SINGLE MODE
-    ext     = Path(rel).suffix.lower()
-    overlay = find_overlay(rel)
+    rel_only = _entry_rel(rel)
+    ext      = Path(rel_only).suffix.lower()
+    overlay  = find_overlay(rel)
+    src_idx, _ = _parse_entry(rel)
+    src_name = Path(_entry_source(rel)).name
     return jsonify({
-        "mode":        "single",
-        "done":        False,
-        "index":       idx,
-        "total":       len(files),
-        "name":        Path(rel).name,
-        "year":        _year_label(rel),
-        "url":         f"/media/{rel}",
-        "is_video":    ext in {".mp4", ".mov"},
-        "can_back":    len(s["history"]) > 0,
-        "overlay_url": f"/media/{overlay}" if overlay else None,
-        "overlay_rel": overlay,
+        "mode":           "single",
+        "done":           False,
+        "index":          idx,
+        "total":          len(files),
+        "name":           Path(rel_only).name,
+        "year":           _year_label(rel),
+        "url":            f"/media/{rel}",
+        "is_video":       ext in {".mp4", ".mov"},
+        "can_back":       len(s["history"]) > 0,
+        "overlay_url":    f"/media/{overlay}" if overlay else None,
+        "overlay_rel":    overlay,
+        "source_idx":     src_idx,
+        "source_name":    src_name,
+        "sources_total":  len(_sources()),
     })
 
 @app.route("/api/action", methods=["POST"])
@@ -1060,20 +1304,20 @@ def api_action():
             for item in last.get("trashed", []):
                 tp = item.get("trash_path")
                 if tp and Path(tp).exists():
-                    shutil.move(tp, str(BASE / item["file"]))
+                    shutil.move(tp, str(_entry_path(item["file"])))
                 otp = item.get("overlay_trash_path")
                 if otp and Path(otp).exists():
-                    shutil.move(otp, str(BASE / item["overlay_rel"]))
-            # Restore kept file(s) from Gardés/
+                    shutil.move(otp, str(_entry_path(item["overlay_rel"])))
+            # Restore kept file(s) from leur Tri/Gardées/
             if last["action"] == "keep_from_group":
                 kept_path = last.get("kept_path")
-                if kept_path and (BASE / kept_path).exists():
-                    shutil.move(str(BASE / kept_path), str(BASE / last["file"]))
+                if kept_path and Path(kept_path).exists():
+                    shutil.move(kept_path, str(_entry_path(last["file"])))
             elif last["action"] in ("keep_all_group", "decide_semantic_group"):
                 for item in last.get("kept_items", []):
                     kp = item.get("kept_path")
-                    if kp and (BASE / kp).exists():
-                        shutil.move(str(BASE / kp), str(BASE / item["file"]))
+                    if kp and Path(kp).exists():
+                        shutil.move(kp, str(_entry_path(item["file"])))
             # Re-insert group files at current position
             group_files       = last.get("group_files_at_time", [])
             current_files_set = set(s["files"])
@@ -1085,25 +1329,25 @@ def api_action():
             target_file = last["file"]
             tp = last.get("trash_path")
             if tp and Path(tp).exists():
-                shutil.move(tp, str(BASE / target_file))
+                shutil.move(tp, str(_entry_path(target_file)))
             if target_file not in s["files"]:
                 s["files"].insert(s["current"], target_file)
             if last.get("overlay_trash_path"):
                 otp = Path(last["overlay_trash_path"])
                 if otp.exists():
-                    shutil.move(str(otp), str(BASE / last["overlay_rel"]))
+                    shutil.move(str(otp), str(_entry_path(last["overlay_rel"])))
             if target_file in s["files"]:
                 s["current"] = s["files"].index(target_file)
 
         elif last["action"] == "keep":
             target_file = last["file"]
             kept_path   = last.get("kept_path")
-            if kept_path and (BASE / kept_path).exists():
-                shutil.move(str(BASE / kept_path), str(BASE / target_file))
+            if kept_path and Path(kept_path).exists():
+                shutil.move(kept_path, str(_entry_path(target_file)))
             if last.get("overlay_trashed") and last.get("overlay_trash_path"):
                 otp = Path(last["overlay_trash_path"])
                 if otp.exists():
-                    shutil.move(str(otp), str(BASE / last["overlay_trashed"]))
+                    shutil.move(str(otp), str(_entry_path(last["overlay_trashed"])))
             if target_file not in s["files"]:
                 s["files"].insert(s["current"], target_file)
             if target_file in s["files"]:
@@ -1276,58 +1520,116 @@ def api_action():
     save_state(s)
     return jsonify({"ok": True})
 
-@app.route("/media/<path:rel>")
-def serve_media(rel):
-    return send_file(str(BASE / rel))
+@app.route("/api/config", methods=["GET"])
+def api_config_get():
+    """Renvoie la config session courante + valeurs par défaut + info sources existantes."""
+    sources_info = []
+    if _is_configured():
+        for idx, p in enumerate(_session_config["sources"]):
+            path = Path(p)
+            sources_info.append({
+                "idx":    idx,
+                "path":   str(path),
+                "exists": path.exists(),
+                "name":   path.name or str(path),
+            })
+    return jsonify({
+        "configured":      _is_configured(),
+        "sources":         _session_config["sources"],
+        "sources_info":    sources_info,
+        "options":         _session_config["options"],
+        "default_options": DEFAULT_OPTIONS,
+    })
+
+@app.route("/api/config", methods=["POST"])
+def api_config_set():
+    """Définit la config de session.
+
+    Payload : {"sources": ["/abs/path1", "/abs/path2"], "options": {...}}
+    """
+    data    = request.get_json() or {}
+    sources = data.get("sources") or []
+    options = data.get("options") or {}
+
+    valid_sources = []
+    for s in sources:
+        if not s:
+            continue
+        p = Path(str(s)).expanduser()
+        if p.exists() and p.is_dir():
+            valid_sources.append(str(p.resolve()))
+
+    if not valid_sources:
+        return jsonify({"ok": False, "error": "Aucun dossier source valide fourni."}), 400
+
+    _session_config["sources"]    = valid_sources
+    _session_config["options"]    = {**DEFAULT_OPTIONS, **{k: bool(v) for k, v in options.items() if k in DEFAULT_OPTIONS}}
+    _session_config["configured"] = True
+    _save_session_config()
+
+    _reset_mem()
+    _init_mem()
+
+    return jsonify({"ok": True, "configured": True,
+                    "sources_count": len(valid_sources),
+                    "files_count":   len(_mem_state.get("files", []))})
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    """Reset complet de la session : retour à la vue accueil."""
+    _session_config["sources"]    = []
+    _session_config["options"]    = dict(DEFAULT_OPTIONS)
+    _session_config["configured"] = False
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    _reset_mem()
+    return jsonify({"ok": True})
+
+@app.route("/api/pick_folder", methods=["POST"])
+def api_pick_folder():
+    """Ouvre un dialog FOLDER macOS natif via pywebview. Renvoie le chemin sélectionné.
+
+    Disponible UNIQUEMENT en contexte pywebview (app.py). En dev browser, renvoie une erreur :
+    l'utilisateur doit alors coller le chemin à la main dans le champ texte.
+    """
+    if _main_window is None:
+        return jsonify({"ok": False, "error": "Dialog natif indisponible (mode dev browser). Colle le chemin à la main."}), 503
+    try:
+        # Import local pour éviter dépendance dure côté core (pywebview = côté app.py)
+        import webview
+        dialog_type = getattr(getattr(webview, "FileDialog", None), "FOLDER", None)
+        if dialog_type is None:
+            dialog_type = getattr(webview, "FOLDER_DIALOG", 2)
+        result = _main_window.create_file_dialog(
+            dialog_type,
+            allow_multiple=False,
+            directory=str(Path.home()),
+        )
+        if not result:
+            return jsonify({"ok": False, "cancelled": True})
+        return jsonify({"ok": True, "path": str(Path(result[0]).expanduser().resolve())})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/media/<path:entry>")
+def serve_media(entry):
+    """Sert un fichier média. `entry` est de la forme '<src_idx>::<rel>'.
+
+    Le '::' peut arriver URL-encodé en %3A%3A (Flask le décode automatiquement).
+    Pour la rétrocompat single-source, '<rel>' sans '::' est aussi accepté.
+    """
+    return send_file(str(_entry_path(entry)))
 
 @app.route("/api/reorganize", methods=["POST"])
 def api_reorganize():
-    s    = load_state()
-    kept = BASE / "Gardés"
-    moved, merged, skipped, errors = 0, 0, 0, []
+    """Deprecated en v0.2.0 : les actions keep/trash déplacent immédiatement.
 
-    for entry in s["history"]:
-        act = entry["action"]
-        if act not in ("keep", "keep_from_group", "keep_all_group"):
-            continue
-
-        if act == "keep_all_group":
-            files_to_move = entry.get("group_files_at_time", [])
-        else:
-            files_to_move = [entry.get("file")] if entry.get("file") else []
-
-        for rel in files_to_move:
-            if not rel:
-                continue
-            src = BASE / rel
-            if not src.exists():
-                skipped += 1
-                continue
-            if act == "keep" and entry.get("overlay_kept"):
-                ov_src = BASE / entry["overlay_kept"]
-                if ov_src.exists():
-                    try:
-                        merge_overlay(src, ov_src)
-                        ov_src.unlink()
-                        merged += 1
-                    except Exception as e:
-                        errors.append(f"{src.name}: {e}")
-            parts   = Path(rel).parts
-            year    = parts[0] if len(parts) > 1 and parts[0].isdigit() else "divers"
-            dst_dir = kept / year
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst = dst_dir / src.name
-            n   = 1
-            while dst.exists():
-                dst = dst_dir / f"{src.stem}_{n}{src.suffix}"
-                n  += 1
-            shutil.move(str(src), str(dst))
-            moved += 1
-
-    s["history"] = []
-    save_state(s)
-    return jsonify({"ok": True, "moved": moved, "merged": merged,
-                    "skipped": skipped, "errors": errors})
+    Plus de "queue" à appliquer en différé — l'historique sert uniquement à l'undo.
+    """
+    return jsonify({"ok": False, "deprecated": True,
+                    "message": "Les actions sont appliquées immédiatement depuis v0.2.0."}), 410
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PAGE HTML
@@ -1584,11 +1886,127 @@ PAGE = r"""<!DOCTYPE html>
 
   .flash { animation: flash .18s ease; }
   @keyframes flash { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  /* ── Welcome view (v0.2.0) ── */
+  #welcome {
+    position: fixed; inset: 0; z-index: 100; overflow: auto;
+    background: #0a0a0a;
+    display: none;
+    align-items: flex-start; justify-content: center;
+    padding: 40px 20px;
+  }
+  #welcome-card {
+    max-width: 560px; width: 100%;
+    background: #131313; border: 1px solid #232323;
+    border-radius: 12px; padding: 28px;
+  }
+  .wc-title { text-align: center; margin-bottom: 24px; }
+  .wc-title h1 { margin: 6px 0 4px; font-size: 22px; font-weight: 600; }
+  .wc-icon { font-size: 38px; }
+  .wc-tag { color: #888; font-size: 13px; margin: 0; }
+  .wc-section { margin: 20px 0; }
+  .wc-section > label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: #888; margin-bottom: 10px; }
+  #wc-sources { list-style: none; padding: 0; margin: 0 0 10px; }
+  #wc-sources li {
+    display: flex; align-items: center; gap: 8px;
+    background: #1a1a1a; border: 1px solid #232323; border-radius: 6px;
+    padding: 8px 12px; margin-bottom: 6px; font-size: 13px;
+  }
+  #wc-sources .wc-src-name { flex: 1; font-family: -apple-system, system-ui; color: #ddd; }
+  #wc-sources .wc-src-path { font-size: 10px; color: #555; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #wc-sources .wc-src-rm {
+    background: transparent; border: 0; color: #f87171;
+    cursor: pointer; padding: 4px 8px; border-radius: 4px;
+    font-size: 16px; line-height: 1;
+  }
+  #wc-sources .wc-src-rm:hover { background: rgba(239,68,68,.12); }
+  #wc-add {
+    width: 100%; background: #1a1a1a; border: 1px dashed #2a2a2a;
+    color: #aaa; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    transition: all .15s;
+  }
+  #wc-add:hover { background: #222; color: #ddd; border-color: #444; }
+  #wc-path-fallback {
+    width: 100%; box-sizing: border-box; margin-top: 8px;
+    background: #1a1a1a; border: 1px solid #2a2a2a; color: #ddd;
+    padding: 10px; border-radius: 6px; font-size: 12px;
+    font-family: ui-monospace, monospace;
+  }
+  .wc-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
+  .wc-opts label {
+    display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ccc;
+    background: #1a1a1a; border: 1px solid #232323; padding: 10px;
+    border-radius: 6px; cursor: pointer; transition: border-color .15s;
+  }
+  .wc-opts label:hover { border-color: #333; }
+  .wc-opts input[type=checkbox] { accent-color: #a78bfa; margin: 0; }
+  .wc-preview {
+    background: #0d0d0d; border: 1px solid #1d1d1d; border-radius: 6px;
+    padding: 12px; font-size: 11px; color: #777; display: flex;
+    flex-direction: column; gap: 4px;
+  }
+  .wc-preview code { color: #a78bfa; font-family: ui-monospace, monospace; font-size: 11px; word-break: break-all; }
+  #wc-start {
+    width: 100%; padding: 14px; background: #16a34a; color: #fff;
+    border: 0; border-radius: 8px; font-size: 15px; font-weight: 600;
+    cursor: pointer; margin-top: 12px; transition: background .15s;
+  }
+  #wc-start:disabled { background: #1f2937; color: #555; cursor: not-allowed; }
+  #wc-start:not(:disabled):hover { background: #15803d; }
+  .wc-err { color: #f87171; font-size: 12px; margin: 8px 0 0; text-align: center; min-height: 18px; }
+  #wc-source-err { color: #f87171; font-size: 11px; margin-top: 6px; min-height: 14px; }
+
+  #btn-reset {
+    background: transparent; border: 1px solid #2a2a2a; color: #888;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  #btn-reset:hover { background: #1a1a1a; color: #ddd; }
+
+  /* v0.2.0 : CLIP/IA caché */
+  #clip-indicator { display: none !important; }
+  #sem-stage      { display: none !important; }
 </style>
 </head>
 <body>
 
 <div id="progress-wrap"><div id="progress-bar"></div></div>
+
+<!-- Welcome view (v0.2.0) -->
+<div id="welcome">
+  <div id="welcome-card">
+    <div class="wc-title">
+      <div class="wc-icon">📁</div>
+      <h1>Sort Memories</h1>
+      <p class="wc-tag">Triez et nettoyez vos dossiers de médias locaux</p>
+    </div>
+
+    <section class="wc-section">
+      <label>Dossiers à trier</label>
+      <ul id="wc-sources"></ul>
+      <button id="wc-add" onclick="wcAddSource()">+ Ajouter un dossier</button>
+      <input id="wc-path-fallback" type="text" placeholder="Coller un chemin (ex: /Users/me/Pictures/Snapchat)" style="display:none">
+      <div id="wc-source-err"></div>
+    </section>
+
+    <section class="wc-section">
+      <label>Options de tri</label>
+      <div class="wc-opts">
+        <label><input type="checkbox" id="opt-by_year" checked> Grouper par année</label>
+        <label><input type="checkbox" id="opt-by_month"> Aussi par mois</label>
+        <label><input type="checkbox" id="opt-split_media"> Séparer images / vidéos</label>
+        <label><input type="checkbox" id="opt-rename"> Renommer (YYYY-MM-DD_hash.ext)</label>
+      </div>
+    </section>
+
+    <div class="wc-preview">
+      <span>Aperçu structure de sortie :</span>
+      <code id="wc-preview-path">&lt;source&gt;/Tri/Gardées/2024/photo.jpg</code>
+    </div>
+
+    <button id="wc-start" onclick="wcStart()" disabled>Démarrer le triage →</button>
+    <p id="wc-error" class="wc-err"></p>
+  </div>
+</div>
 
 <!-- Single mode -->
 <div id="stage">
@@ -1667,6 +2085,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="name" id="fname">Chargement…</div>
     <div class="meta" id="fmeta"></div>
   </div>
+  <button id="btn-reset" onclick="wcReset()" title="Reconfigurer les dossiers et options">⚙ Accueil</button>
   <span id="scan-indicator">
     <button id="btn-rescan" onclick="triggerRescan()" title="Relancer l'analyse des doublons pHash">↻</button>
   </span>
@@ -1865,6 +2284,12 @@ async function load() {
 }
 
 function render() {
+  if (current.mode === 'needs_config') {
+    wcShow();
+    return;
+  }
+  document.getElementById('welcome').style.display = 'none';
+
   document.getElementById('btn-keep-all').style.display      = 'none';
   document.getElementById('btn-trash-all').style.display     = 'none';
   document.getElementById('btn-sem-validate').style.display  = 'none';
@@ -2320,6 +2745,146 @@ async function activateLicense() {
   }
 }
 
+/* ─── Welcome view (v0.2.0) ─────────────────────────────── */
+let wcState = { sources: [], options: { by_year: true, by_month: false, split_media: false, rename: false } };
+
+function wcUpdatePreview() {
+  const parts = ['<source>', 'Tri', 'Gardées'];
+  if (wcState.options.split_media) parts.push('images');
+  if (wcState.options.by_year)     parts.push('2024');
+  if (wcState.options.by_month)    parts.push('05');
+  parts.push(wcState.options.rename ? '2024-05-22_a1b2c3d4.jpg' : 'photo.jpg');
+  document.getElementById('wc-preview-path').textContent = parts.join('/');
+}
+
+function wcRenderSources() {
+  const ul = document.getElementById('wc-sources');
+  ul.innerHTML = '';
+  wcState.sources.forEach((src, i) => {
+    const li    = document.createElement('li');
+    const segs  = src.split('/').filter(Boolean);
+    const name  = segs[segs.length - 1] || src;
+    li.innerHTML = `
+      <span style="opacity:.5">📁</span>
+      <span class="wc-src-name"></span>
+      <span class="wc-src-path"></span>
+      <button class="wc-src-rm" onclick="wcRemoveSource(${i})" title="Retirer">×</button>
+    `;
+    li.querySelector('.wc-src-name').textContent = name;
+    li.querySelector('.wc-src-path').textContent = src;
+    ul.appendChild(li);
+  });
+  document.getElementById('wc-start').disabled = wcState.sources.length === 0;
+}
+
+function wcRemoveSource(i) {
+  wcState.sources.splice(i, 1);
+  wcRenderSources();
+}
+
+function wcSyncOptions() {
+  wcState.options.by_year     = document.getElementById('opt-by_year').checked;
+  wcState.options.by_month    = document.getElementById('opt-by_month').checked;
+  wcState.options.split_media = document.getElementById('opt-split_media').checked;
+  wcState.options.rename      = document.getElementById('opt-rename').checked;
+  wcUpdatePreview();
+}
+
+async function wcAddSource() {
+  const errEl  = document.getElementById('wc-source-err');
+  const input  = document.getElementById('wc-path-fallback');
+  errEl.textContent = '';
+  try {
+    const r = await fetch('/api/pick_folder', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok && j.path) {
+      if (!wcState.sources.includes(j.path)) {
+        wcState.sources.push(j.path);
+        wcRenderSources();
+      }
+      input.style.display = 'none';
+      return;
+    }
+    if (j.cancelled) return;
+    if (j.error)    errEl.textContent = j.error;
+  } catch(_) {
+    errEl.textContent = 'Dialog indisponible — colle un chemin ci-dessous puis Entrée.';
+  }
+  // Fallback : champ texte
+  input.style.display = 'block';
+  input.focus();
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter' && input.value.trim()) {
+      const path = input.value.trim();
+      if (!wcState.sources.includes(path)) wcState.sources.push(path);
+      input.value = '';
+      input.style.display = 'none';
+      errEl.textContent = '';
+      wcRenderSources();
+    }
+  };
+}
+
+async function wcStart() {
+  const btn = document.getElementById('wc-start');
+  const err = document.getElementById('wc-error');
+  err.textContent = '';
+  if (!wcState.sources.length) { err.textContent = 'Ajoute au moins un dossier source.'; return; }
+  btn.disabled = true; btn.textContent = 'Démarrage…';
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(wcState),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      err.textContent = j.error || 'Erreur de configuration';
+      btn.disabled = false; btn.textContent = 'Démarrer le triage →';
+      return;
+    }
+    if (j.files_count === 0) {
+      err.textContent = 'Aucun média trouvé (extensions : jpg, jpeg, png, gif, webp, mp4, mov).';
+      btn.disabled = false; btn.textContent = 'Démarrer le triage →';
+      return;
+    }
+    document.getElementById('welcome').style.display = 'none';
+    load();
+  } catch(e) {
+    err.textContent = e.message || 'Erreur réseau';
+    btn.disabled = false; btn.textContent = 'Démarrer le triage →';
+  }
+}
+
+async function wcReset() {
+  if (!confirm("Retour à l'accueil ? La progression actuelle est conservée — tu pourras la reprendre en re-sélectionnant les mêmes dossiers + options.")) return;
+  await fetch('/api/reset', { method: 'POST' });
+  wcState.sources = [];
+  load();
+}
+
+function wcShow() {
+  document.getElementById('welcome').style.display       = 'flex';
+  document.getElementById('stage').style.display         = 'none';
+  document.getElementById('group-stage').style.display   = 'none';
+  document.getElementById('sem-stage').style.display     = 'none';
+  document.getElementById('bar').style.display           = 'none';
+  document.getElementById('video-ctrl').classList.remove('on');
+  document.getElementById('progress-wrap').style.display = 'none';
+
+  // Bind onchange une seule fois
+  ['by_year','by_month','split_media','rename'].forEach(k => {
+    const el = document.getElementById('opt-' + k);
+    if (el && !el._bound) {
+      el.checked   = wcState.options[k];
+      el.onchange  = wcSyncOptions;
+      el._bound    = true;
+    }
+  });
+  wcRenderSources();
+  wcUpdatePreview();
+}
+
 load();
 </script>
 </body>
@@ -2332,11 +2897,16 @@ load();
 def run_server(port: int = 7777, open_browser: bool = True):
     """Lance le serveur Flask. Utilisé par app.py (open_browser=False) et CLI dev."""
     url = f"http://127.0.0.1:{port}"
+    _load_session_config()
     print(f"\n📁  Sort Memories  —  {url}")
-    print(f"   Media folder : {MEDIA_DIR}")
     print(f"   State folder : {STATE_DIR}")
-    print(f"   CLIP        : {'enabled' if CLIP_AVAILABLE else 'disabled (install torch + open_clip_torch)'}")
-    print("   Raccourcis  : → Garder | ← Retour | D Supprimer | O Overlay\n")
+    if _is_configured():
+        print(f"   Sources      : {', '.join(_session_config['sources'])}")
+        print(f"   Options      : {_session_config['options']}")
+    else:
+        print("   Session      : non configurée (UI affichera l'accueil)")
+    print(f"   CLIP         : {'enabled' if CLIP_AVAILABLE else 'disabled (install torch + open_clip_torch)'}")
+    print("   Raccourcis   : → Garder | ← Retour | D Supprimer | O Overlay\n")
     _init_mem()
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
