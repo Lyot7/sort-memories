@@ -27,15 +27,26 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 
 ### ⚠️ Première ouverture sur macOS (v0.1.x — non encore notarisée)
 
-La v0.1.x n'est pas encore signée Apple Developer ID. macOS Gatekeeper va afficher *"Sort Memories ne peut pas être ouvert car le développeur n'est pas vérifié"* au premier lancement. Pour l'ouvrir :
+La v0.1.x n'est pas signée Apple Developer ID. Au premier lancement, macOS Gatekeeper affiche : *"« Sort Memories » ne peut pas être ouvert car Apple n'a pas pu vérifier qu'il ne contenait pas de logiciel malveillant"* avec uniquement *Placer dans la corbeille* / *Terminé*.
 
-1. **Clic droit** sur `Sort Memories.app` dans `/Applications` → **Ouvrir**
-2. Re-clic sur **Ouvrir** dans la popup
-3. macOS retient ton choix — les lancements suivants se font normalement
+**Méthode rapide (Terminal, 1 commande)** :
 
-Alternative : `Réglages Système` → `Confidentialité et sécurité` → scroller → `"Sort Memories a été bloquée…"` → **Ouvrir quand même**.
+```bash
+xattr -dr com.apple.quarantine "/Applications/Sort Memories.app"
+```
 
-Signature + notarisation Apple arrivent en v0.2.0.
+Cette commande retire le flag de quarantaine que macOS pose sur tout fichier téléchargé. L'app s'ouvre ensuite normalement, sans aucun warning supplémentaire.
+
+**Méthode GUI (sans Terminal)** :
+
+1. Ferme la popup (clic *Terminé*, **pas** *Placer dans la corbeille*)
+2. Ouvre `Réglages Système` → `Confidentialité et sécurité`
+3. Descends en bas, tu verras *« Sort Memories » a été bloquée…* → clic **Ouvrir quand même**
+4. Entre ton mot de passe macOS pour confirmer
+
+Sur macOS Sonoma+/Sequoia, le *clic-droit > Ouvrir* ne suffit plus pour les apps téléchargées via navigateur — passer obligatoirement par l'une des deux méthodes ci-dessus.
+
+Signature Apple Developer ID + notarisation arrivent en v0.2.0 — ces étapes disparaîtront définitivement.
 
 ## Tarification
 
