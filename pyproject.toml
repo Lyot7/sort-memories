@@ -1,6 +1,6 @@
 [project]
 name = "sort-memories"
-version = "0.2.0"
+version = "0.3.0"
 description = "Desktop app to sort and dedupe local media folders (macOS, soon multi-platform)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,7 @@ dependencies = [
     "open-clip-torch>=2.24",
     "pywebview>=5.0",
     "appdirs>=1.4",
+    "send2trash>=1.8",
 ]
 
 [project.optional-dependencies]

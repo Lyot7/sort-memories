@@ -1,5 +1,32 @@
 # Changelog
 
+## [2026-05-24] v0.3.0 — rotation, crop, trim, vidage corbeille
+
+**Type** : Features (édition légère + gestion espace disque)
+**Fichiers modifiés** : `sort_memories/core.py` (endpoints + UI), `app.py`, `pyproject.toml`, `build/SortMemories.spec`, `scripts/build-macos.sh`
+**Description** :
+- **Rotation 90° horaire** (raccourci `T`) — applique in-place sur image (PIL.transpose) et vidéo (ffmpeg `-vf transpose=1`)
+- **Crop image** (raccourci `R` sur image) — overlay drag-to-select, conversion coords display→source, PIL.crop in-place
+- **Trim vidéo** (raccourci `R` sur vidéo) — modal timeline double-handle (start/end), ffmpeg `-ss/-to` avec re-encode H.264 frame-accurate
+- **Vider la corbeille** — bouton `🗑 Vider (N • XX MB)` qui badge le total des fichiers dans `Tri/Supprimées/`, envoi à la Corbeille macOS via `send2trash` (réversible)
+- **Reprise de session** : déjà fonctionnel via `SESSION_FILE` + `STATE_FILE` namespacé, conservation transparente entre fermetures de l'app
+- **Toast notifications** : feedback non-bloquant pour les actions (rotation appliquée, fichiers supprimés, erreurs)
+- **Modal de confirmation générique** : utilisé pour empty_trash, structure réutilisable
+- **Raccourci Échap** : ferme tout overlay/modal actif
+- **Dépendance** : `send2trash>=1.8` ajoutée à pyproject + bundle PyInstaller (~50 KB supplémentaires)
+
+**Endpoints nouveaux** :
+- `POST /api/transform` : `{action: "rotate"|"crop"|"trim", entry, ...params}`
+- `GET /api/trash_info` : `{count, size_bytes, size_human, trash_dirs}`
+- `POST /api/empty_trash` : envoie à la Corbeille macOS
+
+**Tests E2E** :
+- Rotation image (PIL) → fichier modifié, dimensions inversées, toast OK
+- Rotation vidéo (ffmpeg transpose) → mp4 re-encodé H.264 CRF18
+- Trash de 2 fichiers → badge passe à "Vider (2 • 697.7 KB)"
+- empty_trash → "2 fichier(s) envoyé(s) à la Corbeille macOS", badge revient à "Vider"
+- Bundle .app v0.3.0 = 46 MB / 21 MB zip, Flask + send2trash OK
+
 ## [2026-05-24] v0.2.0 — vue d'accueil + multi-source + options de tri
 
 **Type** : Feature majeure

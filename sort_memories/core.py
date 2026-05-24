@@ -1587,6 +1587,193 @@ def api_reset():
     _reset_mem()
     return jsonify({"ok": True})
 
+@app.route("/api/transform", methods=["POST"])
+def api_transform():
+    """Applique une transformation in-place sur le fichier courant.
+
+    Actions :
+    - rotate : {action:"rotate", angle:90|180|270} → rotation horaire (image et vidéo)
+    - crop   : {action:"crop", entry, x, y, w, h}  → coords pixels sur l'image affichée
+    - trim   : {action:"trim", entry, start_s, end_s} → coupe vidéo (start..end en secondes)
+    """
+    data   = request.get_json() or {}
+    action = data.get("action")
+    entry  = data.get("entry")
+    if not entry:
+        return jsonify({"ok": False, "error": "entry manquant"}), 400
+    p = _entry_path(entry)
+    if not p.exists():
+        return jsonify({"ok": False, "error": "fichier introuvable"}), 404
+
+    try:
+        if action == "rotate":
+            angle = int(data.get("angle", 90))
+            return _do_rotate(p, angle)
+        if action == "crop":
+            return _do_crop(p, int(data["x"]), int(data["y"]), int(data["w"]), int(data["h"]))
+        if action == "trim":
+            return _do_trim(p, float(data["start_s"]), float(data["end_s"]))
+        return jsonify({"ok": False, "error": f"action inconnue: {action}"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+def _do_rotate(p: Path, angle: int):
+    """Rotation horaire de l'angle donné (90, 180, 270). In-place."""
+    ext = p.suffix.lower()
+    if ext in IMAGE_EXT:
+        img = Image.open(p)
+        # PIL : ROTATE_270 = 90° clockwise (sens montre)
+        if angle == 90:
+            rotated = img.transpose(Image.Transpose.ROTATE_270)
+        elif angle == 180:
+            rotated = img.transpose(Image.Transpose.ROTATE_180)
+        elif angle == 270:
+            rotated = img.transpose(Image.Transpose.ROTATE_90)
+        else:
+            return jsonify({"ok": False, "error": "angle doit être 90/180/270"}), 400
+        if ext in (".jpg", ".jpeg"):
+            rotated = rotated.convert("RGB")
+            rotated.save(str(p), "JPEG", quality=95, subsampling=0)
+        else:
+            rotated.save(str(p))
+        return jsonify({"ok": True, "kind": "image", "angle": angle})
+
+    if ext in VIDEO_EXT:
+        # ffmpeg transpose : 1=90°CW, 2=90°CCW. 180° = double transpose ou hflip+vflip.
+        tmp = p.with_name(f"_rot_{p.name}")
+        vf  = {90: "transpose=1", 180: "transpose=2,transpose=2", 270: "transpose=2"}.get(angle)
+        if not vf:
+            return jsonify({"ok": False, "error": "angle doit être 90/180/270"}), 400
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", str(p), "-vf", vf,
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "copy", str(tmp),
+        ], capture_output=True, timeout=300)
+        if result.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            return jsonify({"ok": False, "error": result.stderr.decode()[-300:]}), 500
+        tmp.replace(p)
+        return jsonify({"ok": True, "kind": "video", "angle": angle})
+
+    return jsonify({"ok": False, "error": f"extension non supportée: {ext}"}), 400
+
+def _do_crop(p: Path, x: int, y: int, w: int, h: int):
+    """Crop in-place d'une IMAGE. Coords en pixels par rapport à l'image source."""
+    ext = p.suffix.lower()
+    if ext not in IMAGE_EXT:
+        return jsonify({"ok": False, "error": "crop disponible uniquement sur les images (vidéo → trim)"}), 400
+    img = Image.open(p)
+    W, H = img.size
+    left   = max(0, min(W, x))
+    top    = max(0, min(H, y))
+    right  = max(left + 1, min(W, x + w))
+    bottom = max(top + 1, min(H, y + h))
+    if right - left < 4 or bottom - top < 4:
+        return jsonify({"ok": False, "error": "zone de crop trop petite"}), 400
+    cropped = img.crop((left, top, right, bottom))
+    if ext in (".jpg", ".jpeg"):
+        cropped = cropped.convert("RGB")
+        cropped.save(str(p), "JPEG", quality=95, subsampling=0)
+    else:
+        cropped.save(str(p))
+    return jsonify({"ok": True, "kind": "image",
+                    "crop": {"x": left, "y": top, "w": right - left, "h": bottom - top}})
+
+def _do_trim(p: Path, start_s: float, end_s: float):
+    """Trim in-place d'une VIDÉO entre start_s et end_s (secondes)."""
+    ext = p.suffix.lower()
+    if ext not in VIDEO_EXT:
+        return jsonify({"ok": False, "error": "trim disponible uniquement sur les vidéos"}), 400
+    if end_s <= start_s + 0.1:
+        return jsonify({"ok": False, "error": "end doit être > start + 0.1s"}), 400
+    tmp = p.with_name(f"_trim_{p.name}")
+    # Re-encode pour précision frame-accurate (vs -c copy qui est keyframe-aligné).
+    # Vidéo courte donc OK pour les workflows de tri.
+    result = subprocess.run([
+        "ffmpeg", "-y", "-ss", f"{start_s:.3f}", "-to", f"{end_s:.3f}",
+        "-i", str(p),
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "192k",
+        str(tmp),
+    ], capture_output=True, timeout=600)
+    if result.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        return jsonify({"ok": False, "error": result.stderr.decode()[-300:]}), 500
+    tmp.replace(p)
+    return jsonify({"ok": True, "kind": "video",
+                    "trim": {"start_s": start_s, "end_s": end_s, "duration_s": end_s - start_s}})
+
+@app.route("/api/trash_info", methods=["GET"])
+def api_trash_info():
+    """Compte et taille totale des fichiers dans tous les Tri/Supprimées/ des sources actives."""
+    if not _is_configured():
+        return jsonify({"count": 0, "size_bytes": 0, "size_human": "0 B", "trash_dirs": []})
+    count = 0
+    size  = 0
+    dirs  = []
+    for src in _sources():
+        td = src / "Tri" / "Supprimées"
+        if not td.exists():
+            continue
+        dir_count = 0
+        dir_size  = 0
+        for f in td.rglob("*"):
+            if f.is_file():
+                count     += 1
+                dir_count += 1
+                try:
+                    sz = f.stat().st_size
+                    size     += sz
+                    dir_size += sz
+                except Exception:
+                    pass
+        if dir_count > 0:
+            dirs.append({"path": str(td), "count": dir_count, "size_bytes": dir_size})
+
+    def _human(b):
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} TB"
+
+    return jsonify({"count": count, "size_bytes": size, "size_human": _human(size), "trash_dirs": dirs})
+
+@app.route("/api/empty_trash", methods=["POST"])
+def api_empty_trash():
+    """Envoie tous les fichiers de Tri/Supprimées/ à la Corbeille macOS (réversible)."""
+    if not _is_configured():
+        return jsonify({"ok": False, "error": "session non configurée"}), 400
+    try:
+        from send2trash import send2trash
+    except ImportError:
+        return jsonify({"ok": False, "error": "send2trash non installé"}), 500
+
+    moved  = 0
+    failed = []
+    for src in _sources():
+        td = src / "Tri" / "Supprimées"
+        if not td.exists():
+            continue
+        for f in list(td.rglob("*")):
+            if not f.is_file():
+                continue
+            try:
+                send2trash(str(f))
+                moved += 1
+            except Exception as e:
+                failed.append({"path": str(f), "error": str(e)})
+        # Vider aussi les sous-dossiers vides
+        try:
+            for sub in sorted(td.rglob("*"), reverse=True):
+                if sub.is_dir() and not any(sub.iterdir()):
+                    sub.rmdir()
+        except Exception:
+            pass
+
+    return jsonify({"ok": True, "moved": moved, "failed": failed,
+                    "message": f"{moved} fichier(s) envoyé(s) à la Corbeille macOS."})
+
 @app.route("/api/pick_folder", methods=["POST"])
 def api_pick_folder():
     """Ouvre un dialog FOLDER macOS natif via pywebview. Renvoie le chemin sélectionné.
@@ -1956,11 +2143,137 @@ PAGE = r"""<!DOCTYPE html>
   .wc-err { color: #f87171; font-size: 12px; margin: 8px 0 0; text-align: center; min-height: 18px; }
   #wc-source-err { color: #f87171; font-size: 11px; margin-top: 6px; min-height: 14px; }
 
-  #btn-reset {
+  #btn-reset, #btn-rotate, #btn-crop, #btn-empty-trash {
     background: transparent; border: 1px solid #2a2a2a; color: #888;
     padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
   }
-  #btn-reset:hover { background: #1a1a1a; color: #ddd; }
+  #btn-reset:hover, #btn-rotate:hover, #btn-crop:hover, #btn-empty-trash:hover {
+    background: #1a1a1a; color: #ddd; border-color: #444;
+  }
+  #btn-empty-trash[data-active="1"] {
+    color: #fb923c; border-color: rgba(251,146,60,.4);
+  }
+  #btn-empty-trash[data-active="1"]:hover {
+    background: rgba(251,146,60,.12); color: #fdba74;
+  }
+  #empty-trash-label {
+    font-weight: 600;
+  }
+
+  /* ── Modal générique ── */
+  .modal-back {
+    position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.7);
+    display: none; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  .modal-back.show { display: flex; }
+  .modal-card {
+    background: #141414; border: 1px solid #232323; border-radius: 12px;
+    padding: 24px; max-width: 480px; width: 90%;
+  }
+  .modal-card h3 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+  .modal-card p { color: #999; font-size: 13px; line-height: 1.5; margin: 8px 0; }
+  .modal-actions {
+    display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px;
+  }
+  .modal-actions button {
+    padding: 8px 16px; border: 0; border-radius: 6px; font-size: 13px;
+    cursor: pointer; font-weight: 500;
+  }
+  .modal-btn-cancel { background: #1f1f1f; color: #aaa; }
+  .modal-btn-cancel:hover { background: #2a2a2a; color: #ddd; }
+  .modal-btn-confirm { background: #f59e0b; color: #fff; }
+  .modal-btn-confirm:hover { background: #d97706; }
+  .modal-btn-danger { background: #dc2626; color: #fff; }
+  .modal-btn-danger:hover { background: #b91c1c; }
+
+  /* ── Crop overlay (image) ── */
+  #crop-overlay {
+    position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.85);
+    display: none; align-items: center; justify-content: center; flex-direction: column;
+  }
+  #crop-overlay.show { display: flex; }
+  #crop-stage {
+    position: relative; max-width: 90vw; max-height: 78vh;
+    overflow: hidden; cursor: crosshair;
+    background: #0a0a0a;
+  }
+  #crop-img { display: block; max-width: 90vw; max-height: 78vh; user-select: none; -webkit-user-drag: none; }
+  #crop-rect {
+    position: absolute; border: 2px dashed #fff;
+    background: rgba(167,139,250,.18);
+    box-shadow: 0 0 0 99999px rgba(0,0,0,.55);
+    display: none;
+  }
+  #crop-bar {
+    display: flex; align-items: center; gap: 12px; margin-top: 18px;
+    color: #ccc; font-size: 13px;
+  }
+  #crop-info { font-family: ui-monospace, monospace; color: #888; }
+  #crop-bar button {
+    padding: 10px 20px; border: 0; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 600;
+  }
+  .crop-btn-cancel { background: #1f1f1f; color: #aaa; }
+  .crop-btn-cancel:hover { background: #2a2a2a; color: #ddd; }
+  .crop-btn-validate { background: #16a34a; color: #fff; }
+  .crop-btn-validate:hover { background: #15803d; }
+  .crop-btn-validate:disabled { background: #1f2937; color: #555; cursor: not-allowed; }
+
+  /* ── Trim overlay (video) ── */
+  #trim-overlay {
+    position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.9);
+    display: none; align-items: center; justify-content: center; flex-direction: column;
+    padding: 30px;
+  }
+  #trim-overlay.show { display: flex; }
+  #trim-video { max-width: 80vw; max-height: 60vh; border-radius: 6px; background: #000; }
+  #trim-timeline-wrap {
+    width: min(80vw, 800px); margin-top: 24px;
+    background: #1a1a1a; border-radius: 8px; padding: 16px;
+  }
+  #trim-track {
+    position: relative; height: 36px; background: #0a0a0a;
+    border-radius: 4px; cursor: pointer; margin-bottom: 12px;
+  }
+  #trim-selection {
+    position: absolute; top: 0; bottom: 0;
+    background: rgba(167,139,250,.25);
+    border-left: 3px solid #a78bfa; border-right: 3px solid #a78bfa;
+  }
+  .trim-handle {
+    position: absolute; top: -4px; bottom: -4px; width: 14px;
+    background: #a78bfa; border-radius: 3px; cursor: ew-resize;
+    transform: translateX(-7px);
+    display: flex; align-items: center; justify-content: center;
+    color: #1a1a1a; font-size: 10px; font-weight: bold;
+  }
+  #trim-handle-start { left: 0; }
+  #trim-handle-end   { left: 100%; }
+  #trim-times {
+    display: flex; justify-content: space-between; font-size: 12px;
+    font-family: ui-monospace, monospace; color: #888;
+  }
+  #trim-times span b { color: #a78bfa; }
+  #trim-actions {
+    display: flex; gap: 8px; justify-content: center; margin-top: 16px;
+  }
+  #trim-actions button {
+    padding: 10px 20px; border: 0; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 600;
+  }
+
+  /* ── Toast notifications ── */
+  #toast {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+    background: #1a1a1a; color: #fff; padding: 12px 20px;
+    border: 1px solid #333; border-radius: 8px; font-size: 13px;
+    z-index: 300; opacity: 0; transition: opacity .2s ease;
+    pointer-events: none; max-width: 80vw; text-align: center;
+  }
+  #toast.show { opacity: 1; }
+  #toast.error { background: #7f1d1d; border-color: #991b1b; }
+  #toast.success { background: #14532d; border-color: #166534; }
 
   /* v0.2.0 : CLIP/IA caché */
   #clip-indicator { display: none !important; }
@@ -2086,6 +2399,9 @@ PAGE = r"""<!DOCTYPE html>
     <div class="meta" id="fmeta"></div>
   </div>
   <button id="btn-reset" onclick="wcReset()" title="Reconfigurer les dossiers et options">⚙ Accueil</button>
+  <button id="btn-rotate" onclick="transformRotate()" title="Rotation 90° horaire [T]">🔄 <span class="key">T</span></button>
+  <button id="btn-crop"   onclick="openCropOrTrim()" title="Rogner / trim [R]" style="display:none">✂ <span class="key">R</span></button>
+  <button id="btn-empty-trash" onclick="confirmEmptyTrash()" title="Vider Tri/Supprimées vers la Corbeille macOS">🗑 <span id="empty-trash-label">Vider</span></button>
   <span id="scan-indicator">
     <button id="btn-rescan" onclick="triggerRescan()" title="Relancer l'analyse des doublons pHash">↻</button>
   </span>
@@ -2098,6 +2414,56 @@ PAGE = r"""<!DOCTYPE html>
   <button id="btn-sem-validate" onclick="validateSemantic()" style="display:none" disabled>✓ Valider <span class="key">→</span></button>
   <button id="btn-keep" onclick="act('keep')">✓ Garder <span class="key">→</span></button>
   <button id="btn-trash" onclick="act('trash')">🗑 Supprimer <span class="key">↓ / D</span></button>
+</div>
+
+<!-- Toast notifications -->
+<div id="toast"></div>
+
+<!-- Modal de confirmation générique (vider corbeille, etc.) -->
+<div class="modal-back" id="confirm-modal">
+  <div class="modal-card">
+    <h3 id="cm-title">Confirmer</h3>
+    <p id="cm-message">Êtes-vous sûr ?</p>
+    <div class="modal-actions">
+      <button class="modal-btn-cancel" onclick="closeConfirm()">Annuler</button>
+      <button id="cm-confirm-btn" class="modal-btn-danger" onclick="confirmAction()">Confirmer</button>
+    </div>
+  </div>
+</div>
+
+<!-- Crop overlay (image) -->
+<div id="crop-overlay">
+  <div id="crop-stage">
+    <img id="crop-img" src="" alt="">
+    <div id="crop-rect"></div>
+  </div>
+  <div id="crop-bar">
+    <span id="crop-info">Cliquer-glisser sur l'image pour sélectionner la zone à conserver</span>
+    <button class="crop-btn-cancel" onclick="closeCrop()">Annuler <span class="key">Echap</span></button>
+    <button id="crop-validate" class="crop-btn-validate" onclick="validateCrop()" disabled>✓ Valider</button>
+  </div>
+</div>
+
+<!-- Trim overlay (vidéo) -->
+<div id="trim-overlay">
+  <video id="trim-video" controls preload="metadata"></video>
+  <div id="trim-timeline-wrap">
+    <div id="trim-track">
+      <div id="trim-selection">
+        <div class="trim-handle" id="trim-handle-start" title="Début">⟨</div>
+        <div class="trim-handle" id="trim-handle-end" title="Fin">⟩</div>
+      </div>
+    </div>
+    <div id="trim-times">
+      <span>Début : <b id="trim-start-time">0:00</b></span>
+      <span>Durée totale : <b id="trim-total-time">0:00</b></span>
+      <span>Fin : <b id="trim-end-time">0:00</b></span>
+    </div>
+  </div>
+  <div id="trim-actions">
+    <button class="crop-btn-cancel" onclick="closeTrim()">Annuler <span class="key">Echap</span></button>
+    <button id="trim-validate" class="crop-btn-validate" onclick="validateTrim()">✓ Valider la coupe</button>
+  </div>
 </div>
 
 <script>
@@ -2885,7 +3251,372 @@ function wcShow() {
   wcUpdatePreview();
 }
 
+/* ─── Toast notifications ───────────────────────────────── */
+let _toastTimer = null;
+function showToast(msg, kind = 'info', ms = 2500) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = '';
+  if (kind === 'error')   t.classList.add('error');
+  if (kind === 'success') t.classList.add('success');
+  t.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+/* ─── Modal de confirmation générique ────────────────────── */
+let _confirmCallback = null;
+function openConfirm(title, message, confirmText, onConfirm, danger = false) {
+  document.getElementById('cm-title').textContent     = title;
+  document.getElementById('cm-message').textContent   = message;
+  const btn = document.getElementById('cm-confirm-btn');
+  btn.textContent = confirmText;
+  btn.className   = danger ? 'modal-btn-danger' : 'modal-btn-confirm';
+  _confirmCallback = onConfirm;
+  document.getElementById('confirm-modal').classList.add('show');
+}
+function closeConfirm() {
+  document.getElementById('confirm-modal').classList.remove('show');
+  _confirmCallback = null;
+}
+async function confirmAction() {
+  const cb = _confirmCallback;
+  closeConfirm();
+  if (cb) await cb();
+}
+
+/* ─── Empty trash ────────────────────────────────────────── */
+async function updateTrashBadge() {
+  try {
+    const r = await fetch('/api/trash_info');
+    const j = await r.json();
+    const btn   = document.getElementById('btn-empty-trash');
+    const label = document.getElementById('empty-trash-label');
+    if (!btn || !label) return;
+    if (j.count > 0) {
+      label.textContent = `Vider (${j.count} • ${j.size_human})`;
+      btn.dataset.active = '1';
+    } else {
+      label.textContent = 'Vider';
+      delete btn.dataset.active;
+    }
+  } catch(_) {}
+}
+async function confirmEmptyTrash() {
+  const r = await fetch('/api/trash_info');
+  const j = await r.json();
+  if (j.count === 0) { showToast('Aucun fichier à supprimer.', 'info'); return; }
+  openConfirm(
+    'Vider la corbeille',
+    `${j.count} fichier(s) (${j.size_human}) seront envoyés à la Corbeille macOS. Tu pourras les restaurer depuis le Finder si erreur.`,
+    'Envoyer à la Corbeille',
+    async () => {
+      const rr = await fetch('/api/empty_trash', { method: 'POST' });
+      const jj = await rr.json();
+      if (jj.ok) {
+        showToast(jj.message, 'success', 3500);
+        updateTrashBadge();
+      } else {
+        showToast('Erreur : ' + (jj.error || 'inconnue'), 'error', 4000);
+      }
+    },
+    false,
+  );
+}
+setInterval(updateTrashBadge, 5000);
+
+/* ─── Transform : rotate ─────────────────────────────────── */
+async function transformRotate() {
+  if (!current || !current.url) return;
+  const entry = current.url.replace('/media/', '').replace(/\?t=.*$/, '');
+  showToast('Rotation en cours…', 'info', 1500);
+  try {
+    const r = await fetch('/api/transform', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'rotate', entry, angle: 90 }),
+    });
+    const j = await r.json();
+    if (!j.ok) { showToast('Échec rotation : ' + (j.error || ''), 'error', 4000); return; }
+    showToast(j.kind === 'video' ? 'Vidéo pivotée ✓' : 'Image pivotée ✓', 'success', 1500);
+    bustMediaCache();
+  } catch(e) {
+    showToast('Erreur : ' + e.message, 'error', 4000);
+  }
+}
+
+function bustMediaCache() {
+  // Recharger l'élément media courant avec un cache-bust
+  const t = '?t=' + Date.now();
+  const img = document.querySelector('#media-wrap img');
+  const v   = document.querySelector('#media-wrap video');
+  if (img) img.src = current.url + t;
+  if (v) {
+    const cur = v.currentTime;
+    v.src = current.url + t;
+    v.addEventListener('loadedmetadata', () => { v.currentTime = cur; }, { once: true });
+  }
+}
+
+/* ─── Crop image (drag rectangle) ────────────────────────── */
+let cropState = null;
+
+function openCrop() {
+  if (!current || current.is_video) { showToast('Crop indisponible pour les vidéos — utilise R pour le trim.', 'error'); return; }
+  const overlay = document.getElementById('crop-overlay');
+  const img     = document.getElementById('crop-img');
+  const rect    = document.getElementById('crop-rect');
+  const valBtn  = document.getElementById('crop-validate');
+  cropState = { active: false, startX: 0, startY: 0, x: 0, y: 0, w: 0, h: 0, naturalW: 0, naturalH: 0, dispW: 0, dispH: 0 };
+  rect.style.display = 'none';
+  valBtn.disabled = true;
+  img.onload = () => {
+    cropState.naturalW = img.naturalWidth;
+    cropState.naturalH = img.naturalHeight;
+    cropState.dispW    = img.clientWidth;
+    cropState.dispH    = img.clientHeight;
+    document.getElementById('crop-info').textContent =
+      `Image ${img.naturalWidth}×${img.naturalHeight} — cliquer-glisser pour sélectionner`;
+  };
+  img.src = current.url + '?t=' + Date.now();
+  overlay.classList.add('show');
+}
+
+function closeCrop() {
+  document.getElementById('crop-overlay').classList.remove('show');
+  cropState = null;
+}
+
+(function bindCropHandlers() {
+  const stage = document.getElementById('crop-stage');
+  const rect  = document.getElementById('crop-rect');
+  const valBtn = document.getElementById('crop-validate');
+  if (!stage) return;
+  stage.addEventListener('mousedown', (e) => {
+    if (!cropState) return;
+    const r = stage.getBoundingClientRect();
+    cropState.active = true;
+    cropState.startX = e.clientX - r.left;
+    cropState.startY = e.clientY - r.top;
+    cropState.x = cropState.startX;
+    cropState.y = cropState.startY;
+    cropState.w = 0;
+    cropState.h = 0;
+    rect.style.left = cropState.x + 'px';
+    rect.style.top  = cropState.y + 'px';
+    rect.style.width  = '0px';
+    rect.style.height = '0px';
+    rect.style.display = 'block';
+    valBtn.disabled = true;
+  });
+  stage.addEventListener('mousemove', (e) => {
+    if (!cropState || !cropState.active) return;
+    const r = stage.getBoundingClientRect();
+    const cx = Math.max(0, Math.min(cropState.dispW, e.clientX - r.left));
+    const cy = Math.max(0, Math.min(cropState.dispH, e.clientY - r.top));
+    cropState.x = Math.min(cropState.startX, cx);
+    cropState.y = Math.min(cropState.startY, cy);
+    cropState.w = Math.abs(cx - cropState.startX);
+    cropState.h = Math.abs(cy - cropState.startY);
+    rect.style.left   = cropState.x + 'px';
+    rect.style.top    = cropState.y + 'px';
+    rect.style.width  = cropState.w + 'px';
+    rect.style.height = cropState.h + 'px';
+  });
+  stage.addEventListener('mouseup', () => {
+    if (!cropState) return;
+    cropState.active = false;
+    if (cropState.w > 8 && cropState.h > 8) {
+      valBtn.disabled = false;
+      document.getElementById('crop-info').textContent =
+        `Zone : ${Math.round(cropState.w * cropState.naturalW / cropState.dispW)}×${Math.round(cropState.h * cropState.naturalH / cropState.dispH)} px`;
+    } else {
+      valBtn.disabled = true;
+    }
+  });
+})();
+
+async function validateCrop() {
+  if (!cropState || cropState.w < 8 || cropState.h < 8) return;
+  // Convertir coords display → coords image source
+  const scaleX = cropState.naturalW / cropState.dispW;
+  const scaleY = cropState.naturalH / cropState.dispH;
+  const payload = {
+    action: 'crop',
+    entry:  current.url.replace('/media/', '').replace(/\?t=.*$/, ''),
+    x: Math.round(cropState.x * scaleX),
+    y: Math.round(cropState.y * scaleY),
+    w: Math.round(cropState.w * scaleX),
+    h: Math.round(cropState.h * scaleY),
+  };
+  document.getElementById('crop-validate').disabled = true;
+  document.getElementById('crop-validate').textContent = 'Application…';
+  try {
+    const r = await fetch('/api/transform', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!j.ok) { showToast('Échec crop : ' + (j.error || ''), 'error', 4000); return; }
+    showToast(`Image recadrée (${j.crop.w}×${j.crop.h}) ✓`, 'success');
+    closeCrop();
+    bustMediaCache();
+  } catch(e) {
+    showToast('Erreur : ' + e.message, 'error', 4000);
+  } finally {
+    document.getElementById('crop-validate').textContent = '✓ Valider';
+  }
+}
+
+/* ─── Trim vidéo (double-handle timeline) ────────────────── */
+let trimState = null;
+
+function openTrim() {
+  if (!current || !current.is_video) { showToast('Trim disponible uniquement pour les vidéos.', 'error'); return; }
+  const overlay = document.getElementById('trim-overlay');
+  const v       = document.getElementById('trim-video');
+  trimState = { start: 0, end: 0, duration: 0 };
+  v.src = current.url + '?t=' + Date.now();
+  v.addEventListener('loadedmetadata', () => {
+    trimState.duration = v.duration;
+    trimState.start    = 0;
+    trimState.end      = v.duration;
+    document.getElementById('trim-total-time').textContent = fmtSec(v.duration);
+    updateTrimUI();
+  }, { once: true });
+  overlay.classList.add('show');
+}
+
+function closeTrim() {
+  document.getElementById('trim-overlay').classList.remove('show');
+  const v = document.getElementById('trim-video');
+  v.pause();
+  v.removeAttribute('src');
+  v.load();
+  trimState = null;
+}
+
+function fmtSec(s) {
+  if (!s || isNaN(s)) return '0:00';
+  const m   = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2,'0')}`;
+}
+
+function updateTrimUI() {
+  if (!trimState) return;
+  const pctStart = trimState.duration ? (trimState.start / trimState.duration) * 100 : 0;
+  const pctEnd   = trimState.duration ? (trimState.end   / trimState.duration) * 100 : 100;
+  const sel = document.getElementById('trim-selection');
+  sel.style.left  = pctStart + '%';
+  sel.style.right = (100 - pctEnd) + '%';
+  document.getElementById('trim-start-time').textContent = fmtSec(trimState.start);
+  document.getElementById('trim-end-time').textContent   = fmtSec(trimState.end);
+}
+
+(function bindTrimHandlers() {
+  const track = document.getElementById('trim-track');
+  const hStart = document.getElementById('trim-handle-start');
+  const hEnd   = document.getElementById('trim-handle-end');
+  if (!track) return;
+  let dragging = null;
+
+  const onMove = (e) => {
+    if (!trimState || !dragging) return;
+    const r   = track.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    const t   = pct * trimState.duration;
+    const v   = document.getElementById('trim-video');
+    if (dragging === 'start') {
+      trimState.start = Math.max(0, Math.min(trimState.end - 0.1, t));
+      v.currentTime = trimState.start;
+    } else if (dragging === 'end') {
+      trimState.end = Math.max(trimState.start + 0.1, Math.min(trimState.duration, t));
+      v.currentTime = trimState.end;
+    }
+    updateTrimUI();
+  };
+
+  hStart.addEventListener('mousedown', (e) => { dragging = 'start'; e.preventDefault(); });
+  hEnd.addEventListener('mousedown',   (e) => { dragging = 'end';   e.preventDefault(); });
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup',   () => { dragging = null; });
+})();
+
+async function validateTrim() {
+  if (!trimState || trimState.end <= trimState.start + 0.1) {
+    showToast('Sélection trop courte.', 'error'); return;
+  }
+  const btn = document.getElementById('trim-validate');
+  btn.disabled = true; btn.textContent = 'Encodage…';
+  const payload = {
+    action: 'trim',
+    entry:  current.url.replace('/media/', '').replace(/\?t=.*$/, ''),
+    start_s: trimState.start,
+    end_s:   trimState.end,
+  };
+  try {
+    const r = await fetch('/api/transform', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!j.ok) { showToast('Échec trim : ' + (j.error || ''), 'error', 5000); return; }
+    showToast(`Vidéo coupée (${fmtSec(j.trim.duration_s)}) ✓`, 'success');
+    closeTrim();
+    bustMediaCache();
+  } catch(e) {
+    showToast('Erreur : ' + e.message, 'error', 5000);
+  } finally {
+    btn.textContent = '✓ Valider la coupe';
+    btn.disabled = false;
+  }
+}
+
+function openCropOrTrim() {
+  if (!current) return;
+  if (current.is_video) openTrim();
+  else                  openCrop();
+}
+
+/* ─── Keyboard : T (rotation) + R (crop/trim) + Escape ──── */
+document.addEventListener('keydown', (e) => {
+  // Si une modal ou overlay est ouvert, gérer Echap d'abord
+  if (e.key === 'Escape') {
+    if (document.getElementById('crop-overlay').classList.contains('show'))    { closeCrop();    e.preventDefault(); return; }
+    if (document.getElementById('trim-overlay').classList.contains('show'))    { closeTrim();    e.preventDefault(); return; }
+    if (document.getElementById('confirm-modal').classList.contains('show'))   { closeConfirm(); e.preventDefault(); return; }
+    return;
+  }
+  // Bloquer si dans un input/textarea ou welcome view actif
+  if (e.target.matches('input, textarea, select')) return;
+  if (getComputedStyle(document.getElementById('welcome')).display !== 'none') return;
+  // Bloquer si overlay actif (crop/trim handlers gérés dans la modale)
+  if (document.getElementById('crop-overlay').classList.contains('show')) return;
+  if (document.getElementById('trim-overlay').classList.contains('show')) return;
+
+  if (e.key === 't' || e.key === 'T') { transformRotate(); e.preventDefault(); return; }
+  if (e.key === 'r' || e.key === 'R') { openCropOrTrim(); e.preventDefault(); return; }
+});
+
+/* Mise à jour conditionnelle du bouton crop/trim selon le type */
+(function updateCropButtonVisibility() {
+  const obs = setInterval(() => {
+    const btn = document.getElementById('btn-crop');
+    if (!btn) return;
+    if (!current || current.mode === 'needs_config' || current.mode === 'trial_limit' || current.done) {
+      btn.style.display = 'none';
+      return;
+    }
+    btn.style.display = '';
+    btn.innerHTML = current.is_video
+      ? '✂ Trim <span class="key">R</span>'
+      : '✂ Rogner <span class="key">R</span>';
+  }, 800);
+})();
+
 load();
+updateTrashBadge();
 </script>
 </body>
 </html>"""

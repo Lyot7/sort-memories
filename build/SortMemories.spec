@@ -17,7 +17,8 @@ hiddenimports = []
 hiddenimports += collect_submodules("flask")
 hiddenimports += collect_submodules("webview")
 hiddenimports += collect_submodules("sort_memories")
-hiddenimports += ["PIL._tkinter_finder", "imagehash"]
+hiddenimports += collect_submodules("send2trash")
+hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash"]
 
 datas = []
 datas += collect_data_files("webview")
@@ -86,12 +87,12 @@ app = BUNDLE(
     name="Sort Memories.app",
     icon=None,
     bundle_identifier="fr.eliottbouquerel.sortmemories",
-    version="0.2.0",
+    version="0.3.0",
     info_plist={
         "CFBundleName": "Sort Memories",
         "CFBundleDisplayName": "Sort Memories",
-        "CFBundleVersion": "0.2.0",
-        "CFBundleShortVersionString": "0.2.0",
+        "CFBundleVersion": "0.3.0",
+        "CFBundleShortVersionString": "0.3.0",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
         "NSHumanReadableCopyright": "© 2026 Eliott Bouquerel. Tous droits réservés.",

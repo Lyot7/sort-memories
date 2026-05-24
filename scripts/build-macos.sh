@@ -15,7 +15,7 @@ fi
 
 echo "Installing dependencies…"
 .venv/bin/pip install --quiet --upgrade pip
-.venv/bin/pip install --quiet flask pillow imagehash numpy pywebview appdirs pyinstaller
+.venv/bin/pip install --quiet flask pillow imagehash numpy pywebview appdirs send2trash pyinstaller
 
 echo "Cleaning previous build…"
 rm -rf dist build/work

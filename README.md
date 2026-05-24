@@ -15,12 +15,15 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 - 📁 **Écran d'accueil** : ajoute N dossiers source, choisis tes options, démarre — pas de Finder intrusif au lancement
 - 🗂️ **Options de tri combinables** : grouper par année / aussi par mois / séparer images-vidéos / renommer en `YYYY-MM-DD_<hash>.ext`
 - 🖼️ **Triage rapide** : flèches gauche/droite pour parcourir, `D` pour supprimer, `O` pour overlay
+- 🔄 **Rotation 90°** : raccourci `T` — applique in-place sur image et vidéo
+- ✂ **Crop image / Trim vidéo** : raccourci `R` — drag-to-select sur image, timeline double-handle sur vidéo
+- 🗑 **Vider la corbeille** : bouton qui envoie tous les `Tri/Supprimées/` à la Corbeille macOS (réversible)
 - ↶ **Undo** : `←` revient en arrière sans perdre l'état (keep et delete réversibles)
 - 🔍 **Déduplication pHash** : détecte les copies exactes ou re-encodées (resize, conversion JPG↔PNG, etc.)
-- 🎬 **Support vidéo** : extraction de frames pour détection de doublons MP4/MOV
+- 🎬 **Support vidéo** : MP4/MOV (rotation, trim, dedupe par frames)
 - 💾 **100% local** : aucun upload, aucune télémétrie, aucune dépendance cloud
 - ⏯️ **Reprise de session** : ferme et reprends quand tu veux, l'état est sauvegardé par config (sources × options)
-- 🔜 **Recherche sémantique CLIP** : prévue pour v0.3.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
+- 🔜 **Recherche sémantique CLIP** : prévue pour v0.4.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
 
 ## Installation
 
