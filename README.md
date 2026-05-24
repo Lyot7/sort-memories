@@ -23,7 +23,8 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 - 🎬 **Support vidéo** : MP4/MOV (rotation, trim, dedupe par frames)
 - 💾 **100% local** : aucun upload, aucune télémétrie, aucune dépendance cloud
 - ⏯️ **Reprise de session** : ferme et reprends quand tu veux, l'état est sauvegardé par config (sources × options)
-- 🔜 **Recherche sémantique CLIP** : prévue pour v0.4.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
+- 📦 **Compression pré-triage** : convertit JPG/PNG en WebP et MP4/MOV en H.265 avant tri. 3 presets (Sans perte / Équilibré / Compact). Gain disque ~30-90% selon preset.
+- 🔜 **Recherche sémantique CLIP** : prévue pour v0.5.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
 
 ## Installation
 

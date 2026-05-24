@@ -1,5 +1,33 @@
 # Changelog
 
+## [2026-05-24] v0.4.0 — compression pré-triage (WebP + H.265)
+
+**Type** : Feature
+**Story** : Gagner de l'espace disque + tri plus fluide
+**Fichiers modifiés** : `sort_memories/core.py` (endpoints + UI welcome), `pyproject.toml`, `build/SortMemories.spec`
+**Description** :
+- **Section "Compression (optionnel)" dans la welcome view** : 4 radios (Aucune / Sans perte / Équilibré / Compact)
+- **3 presets opinionated** :
+  - Sans perte : WebP q90 + H.265 CRF 22 (gain ~30-50%, imperceptible)
+  - Équilibré : WebP q82 + H.265 CRF 25 (gain ~50-70%, légère perte)
+  - Compact : WebP q72 + H.265 CRF 28 (gain ~70-90%, acceptable)
+- **Worker thread daemon** avec status polling + cancel
+- **Skip intelligent** : fichiers déjà au format cible (WebP, H.265), fichiers < 50 KB, fichiers sans gain ≥ 5%
+- **Validation state auto** dans `_init_mem` : après conversion, les entries pointant sur fichiers absents sont droppées et les nouveaux fichiers (extensions changées .jpg → .webp) sont ajoutés. Aucune perte d'état entre conversion et reprise du triage.
+- **Modal progress** avec barre, fichier en cours, % done, octets économisés temps réel, bouton Annuler
+- **Confirmation modale forte** avant lancement (irréversible — remplace les originaux)
+
+**Endpoints nouveaux** :
+- `GET  /api/convert/preview` : count + size_human des fichiers convertibles
+- `POST /api/convert/start`   : `{preset: "lossless"|"balanced"|"compact"}` → thread daemon
+- `GET  /api/convert/status`  : progression temps réel (running, current, total, bytes_saved, errors)
+- `POST /api/convert/cancel`  : interrompt le worker (les fichiers déjà convertis restent)
+
+**Tests E2E** :
+- 2 fichiers JPG (1.5 MB total) → preset compact → 2 fichiers WebP (440 KB total) = 70% gain (1.1 MB économisés)
+- Validation state : après conversion, le triage reprend correctement sur les .webp
+- Bundle .app v0.4.0 = 46 MB / 22 MB zip
+
 ## [2026-05-24] v0.3.0 — rotation, crop, trim, vidage corbeille
 
 **Type** : Features (édition légère + gestion espace disque)

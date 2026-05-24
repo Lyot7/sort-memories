@@ -463,6 +463,18 @@ def _init_mem():
     if not _mem_state.get("files"):
         _mem_state["files"] = collect_files()
         _write_state_file()
+    else:
+        # Validation post-conversion : drop entries pointant sur fichiers absents,
+        # puis ajouter les nouveaux fichiers (extensions changées : .jpg → .webp etc.)
+        existing      = [f for f in _mem_state["files"] if _entry_path(f).exists()]
+        already_known = set(existing)
+        new_files     = [f for f in collect_files() if f not in already_known]
+        if len(existing) != len(_mem_state["files"]) or new_files:
+            _mem_state["files"] = existing + new_files
+            # Ajuster current si on a perdu des fichiers avant lui
+            if _mem_state["current"] > len(_mem_state["files"]):
+                _mem_state["current"] = len(_mem_state["files"])
+            _write_state_file()
     # Groupes sémantiques CLIP
     if CLIP_GROUPS_PATH.exists():
         try:
@@ -1774,6 +1786,236 @@ def api_empty_trash():
     return jsonify({"ok": True, "moved": moved, "failed": failed,
                     "message": f"{moved} fichier(s) envoyé(s) à la Corbeille macOS."})
 
+# ── Conversion / compression (v0.4.0) ────────────────────────────────────────
+CONVERT_PRESETS = {
+    "lossless": {"label": "Sans perte",  "webp_quality": 90, "x265_crf": 22, "x265_preset": "medium"},
+    "balanced": {"label": "Équilibré",   "webp_quality": 82, "x265_crf": 25, "x265_preset": "medium"},
+    "compact":  {"label": "Compact",     "webp_quality": 72, "x265_crf": 28, "x265_preset": "medium"},
+}
+
+_convert_status = {
+    "running": False, "done": False, "cancelled": False,
+    "total": 0, "current": 0,
+    "current_file": "", "preset": "",
+    "bytes_before": 0, "bytes_after": 0,
+    "converted": 0, "skipped": 0, "errors": [],
+    "started_at": None, "finished_at": None,
+}
+_convert_lock = threading.Lock()
+_convert_thread = None
+MIN_CONVERT_SIZE = 50_000  # ne pas convertir les fichiers < 50 KB (gain négligeable)
+
+def _collect_convertible_files():
+    """Liste tous les médias des sources hors Tri/ et _a_supprimer/."""
+    if not _is_configured():
+        return []
+    files = []
+    skip_dirs = {"Tri", "_a_supprimer"}
+    for src in _sources():
+        if not src.exists():
+            continue
+        for f in src.rglob("*"):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in MEDIA_EXT:
+                continue
+            if f.name.startswith(".") or f.name.endswith("-overlay.png"):
+                continue
+            try:
+                rel_parts = f.relative_to(src).parts
+            except Exception:
+                continue
+            if any(part in skip_dirs for part in rel_parts):
+                continue
+            files.append(f)
+    return files
+
+def _video_codec(p: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(p)],
+            capture_output=True, text=True, timeout=10)
+        return r.stdout.strip().lower()
+    except Exception:
+        return ""
+
+def _convert_one(p: Path, preset: dict):
+    """Convertit un fichier. Retourne (size_before, size_after, status, err)."""
+    ext = p.suffix.lower()
+    size_before = p.stat().st_size
+
+    if size_before < MIN_CONVERT_SIZE:
+        return size_before, size_before, "skipped", "trop petit"
+
+    if ext in IMAGE_EXT:
+        if ext == ".webp":
+            return size_before, size_before, "skipped", "déjà WebP"
+        try:
+            img = Image.open(p)
+            if img.mode in ("RGBA", "P", "LA"):
+                bg = Image.new("RGB", img.size, (0, 0, 0))
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                if img.mode in ("RGBA", "LA"):
+                    bg.paste(img, mask=img.split()[-1])
+                    img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            target = p.with_suffix(".webp")
+            tmp = target.with_name("_conv_" + target.name)
+            img.save(tmp, "WEBP", quality=preset["webp_quality"], method=6)
+            size_after = tmp.stat().st_size
+            if size_after >= size_before * 0.95:
+                tmp.unlink(missing_ok=True)
+                return size_before, size_before, "skipped", "pas de gain (≤5%)"
+            p.unlink()
+            tmp.rename(target)
+            return size_before, size_after, "converted", None
+        except Exception as e:
+            return size_before, size_before, "error", str(e)[:200]
+
+    if ext in VIDEO_EXT:
+        codec = _video_codec(p)
+        if codec in ("hevc", "h265"):
+            return size_before, size_before, "skipped", "déjà H.265"
+        tmp = p.with_name(f"_conv_{p.stem}.mp4")
+        try:
+            r = subprocess.run([
+                "ffmpeg", "-y", "-i", str(p),
+                "-c:v", "libx265", "-crf", str(preset["x265_crf"]),
+                "-preset", preset["x265_preset"],
+                "-c:a", "aac", "-b:a", "128k",
+                "-tag:v", "hvc1",
+                str(tmp),
+            ], capture_output=True, timeout=1800)
+            if r.returncode != 0:
+                tmp.unlink(missing_ok=True)
+                return size_before, size_before, "error", r.stderr.decode()[-200:]
+            size_after = tmp.stat().st_size
+            if size_after >= size_before * 0.95:
+                tmp.unlink(missing_ok=True)
+                return size_before, size_before, "skipped", "pas de gain (≤5%)"
+            new_path = p.with_suffix(".mp4")
+            p.unlink()
+            tmp.rename(new_path)
+            return size_before, size_after, "converted", None
+        except subprocess.TimeoutExpired:
+            tmp.unlink(missing_ok=True)
+            return size_before, size_before, "error", "timeout (>30 min)"
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            return size_before, size_before, "error", str(e)[:200]
+
+    return size_before, size_before, "skipped", "format non supporté"
+
+def _convert_worker(preset_key: str):
+    global _convert_status
+    import datetime as _dt
+    preset = CONVERT_PRESETS.get(preset_key)
+    files = _collect_convertible_files()
+    with _convert_lock:
+        _convert_status.update({
+            "running": True, "done": False, "cancelled": False,
+            "total": len(files), "current": 0,
+            "current_file": "", "preset": preset_key,
+            "bytes_before": 0, "bytes_after": 0,
+            "converted": 0, "skipped": 0, "errors": [],
+            "started_at": _dt.datetime.now().isoformat(), "finished_at": None,
+        })
+
+    for i, f in enumerate(files):
+        with _convert_lock:
+            if _convert_status["cancelled"]:
+                break
+            _convert_status["current"] = i + 1
+            _convert_status["current_file"] = f.name
+
+        size_before, size_after, status, err = _convert_one(f, preset)
+
+        with _convert_lock:
+            _convert_status["bytes_before"] += size_before
+            _convert_status["bytes_after"]  += size_after
+            if status == "converted":
+                _convert_status["converted"] += 1
+            elif status == "skipped":
+                _convert_status["skipped"] += 1
+            elif status == "error":
+                _convert_status["errors"].append({"file": f.name, "error": err})
+
+    with _convert_lock:
+        _convert_status["running"] = False
+        _convert_status["done"] = True
+        _convert_status["finished_at"] = _dt.datetime.now().isoformat()
+
+    # Si une session existait, invalider son STATE_FILE pour que /api/config relise
+    # la liste des fichiers (extensions ont changé jpg→webp, mp4 peut être renommé).
+    if _is_configured() and _convert_status["converted"] > 0:
+        try:
+            STATE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        _reset_mem()
+
+@app.route("/api/convert/preview", methods=["GET"])
+def api_convert_preview():
+    files = _collect_convertible_files()
+    total = sum(f.stat().st_size for f in files if f.exists())
+    def _human(b):
+        for u in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.1f} {u}"
+            b /= 1024
+        return f"{b:.1f} TB"
+    return jsonify({
+        "count":      len(files),
+        "size_bytes": total,
+        "size_human": _human(total),
+        "presets":    {k: {"label": v["label"]} for k, v in CONVERT_PRESETS.items()},
+    })
+
+@app.route("/api/convert/start", methods=["POST"])
+def api_convert_start():
+    global _convert_thread
+    if not _is_configured():
+        return jsonify({"ok": False, "error": "Ajoute au moins un dossier source d'abord."}), 400
+    with _convert_lock:
+        if _convert_status["running"]:
+            return jsonify({"ok": False, "error": "Conversion déjà en cours."}), 409
+    data = request.get_json() or {}
+    preset_key = data.get("preset")
+    if preset_key not in CONVERT_PRESETS:
+        return jsonify({"ok": False, "error": f"Preset invalide. Choix : {list(CONVERT_PRESETS)}"}), 400
+    _convert_thread = threading.Thread(target=_convert_worker, args=(preset_key,), daemon=True)
+    _convert_thread.start()
+    return jsonify({"ok": True, "preset": preset_key})
+
+@app.route("/api/convert/status", methods=["GET"])
+def api_convert_status():
+    with _convert_lock:
+        st = dict(_convert_status)
+    def _human(b):
+        for u in ("B", "KB", "MB", "GB"):
+            if abs(b) < 1024:
+                return f"{b:.1f} {u}"
+            b /= 1024
+        return f"{b:.1f} TB"
+    saved = st["bytes_before"] - st["bytes_after"]
+    st["bytes_before_h"] = _human(st["bytes_before"])
+    st["bytes_after_h"]  = _human(st["bytes_after"])
+    st["bytes_saved_h"]  = _human(saved)
+    st["bytes_saved"]    = saved
+    st["percent"]        = round((st["current"] / st["total"] * 100) if st["total"] else 0)
+    return jsonify(st)
+
+@app.route("/api/convert/cancel", methods=["POST"])
+def api_convert_cancel():
+    with _convert_lock:
+        if not _convert_status["running"]:
+            return jsonify({"ok": False, "error": "Pas de conversion en cours."}), 400
+        _convert_status["cancelled"] = True
+    return jsonify({"ok": True})
+
 @app.route("/api/pick_folder", methods=["POST"])
 def api_pick_folder():
     """Ouvre un dialog FOLDER macOS natif via pywebview. Renvoie le chemin sélectionné.
@@ -2143,6 +2385,48 @@ PAGE = r"""<!DOCTYPE html>
   .wc-err { color: #f87171; font-size: 12px; margin: 8px 0 0; text-align: center; min-height: 18px; }
   #wc-source-err { color: #f87171; font-size: 11px; margin-top: 6px; min-height: 14px; }
 
+  .wc-hint { font-size: 11px; color: #888; margin: 0 0 10px; line-height: 1.5; }
+  .wc-presets { display: flex; flex-direction: column; gap: 6px; }
+  .wc-preset {
+    display: grid; grid-template-columns: auto 1fr; column-gap: 10px;
+    align-items: center;
+    background: #1a1a1a; border: 1px solid #232323; padding: 10px 12px;
+    border-radius: 6px; cursor: pointer; transition: all .15s;
+  }
+  .wc-preset:hover { border-color: #333; background: #1f1f1f; }
+  .wc-preset input { accent-color: #fb923c; margin: 0; grid-row: 1 / 3; }
+  .wc-preset .wc-pres-name { font-size: 13px; color: #ddd; font-weight: 500; }
+  .wc-preset .wc-pres-desc { font-size: 11px; color: #777; grid-column: 2; }
+  .wc-preset:has(input:checked) { border-color: #fb923c; background: rgba(251,146,60,.08); }
+  .wc-convert-info {
+    margin-top: 10px; font-size: 12px; color: #888;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .wc-convert-info button {
+    background: rgba(251,146,60,.15); border: 1px solid rgba(251,146,60,.4); color: #fb923c;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
+  }
+  .wc-convert-info button:hover { background: rgba(251,146,60,.25); }
+  .wc-convert-info button:disabled { background: #1a1a1a; color: #555; border-color: #2a2a2a; cursor: not-allowed; }
+
+  #cvm-bar-wrap {
+    background: #0a0a0a; border-radius: 4px; height: 8px; overflow: hidden; margin: 14px 0 10px;
+  }
+  #cvm-bar {
+    height: 100%; width: 0%; background: linear-gradient(90deg, #fb923c, #f59e0b);
+    transition: width .3s ease;
+  }
+  #cvm-stats {
+    display: flex; justify-content: space-between; font-size: 12px; color: #aaa;
+    margin: 4px 0;
+  }
+  #cvm-stats b { color: #fff; }
+  #cvm-summary {
+    background: #0d0d0d; border: 1px solid #1d1d1d; border-radius: 6px;
+    padding: 12px; margin-top: 14px; font-size: 12px; color: #aaa; line-height: 1.6;
+  }
+  #cvm-summary b { color: #4ade80; }
+
   #btn-reset, #btn-rotate, #btn-crop, #btn-empty-trash {
     background: transparent; border: 1px solid #2a2a2a; color: #888;
     padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
@@ -2316,8 +2600,40 @@ PAGE = r"""<!DOCTYPE html>
       <code id="wc-preview-path">&lt;source&gt;/Tri/Gardées/2024/photo.jpg</code>
     </div>
 
+    <section class="wc-section">
+      <label>Compression avant tri (optionnel)</label>
+      <p class="wc-hint">Convertit JPG/PNG en WebP et MP4/MOV en H.265. Gain disque + tri plus fluide. <b style="color:#fb923c">Irréversible</b> — les originaux sont remplacés.</p>
+      <div class="wc-presets">
+        <label class="wc-preset"><input type="radio" name="wc-preset" value="none" checked> <span class="wc-pres-name">Aucune</span><span class="wc-pres-desc">Tri direct sur les originaux</span></label>
+        <label class="wc-preset"><input type="radio" name="wc-preset" value="lossless"> <span class="wc-pres-name">Sans perte</span><span class="wc-pres-desc">WebP q90 + H.265 CRF 22 — gain ~30-50%, imperceptible</span></label>
+        <label class="wc-preset"><input type="radio" name="wc-preset" value="balanced"> <span class="wc-pres-name">Équilibré</span><span class="wc-pres-desc">WebP q82 + H.265 CRF 25 — gain ~50-70%, légère perte</span></label>
+        <label class="wc-preset"><input type="radio" name="wc-preset" value="compact"> <span class="wc-pres-name">Compact</span><span class="wc-pres-desc">WebP q72 + H.265 CRF 28 — gain ~70-90%, perte acceptable</span></label>
+      </div>
+      <div id="wc-convert-info" class="wc-convert-info"></div>
+    </section>
+
     <button id="wc-start" onclick="wcStart()" disabled>Démarrer le triage →</button>
     <p id="wc-error" class="wc-err"></p>
+  </div>
+</div>
+
+<!-- Modal progression conversion -->
+<div class="modal-back" id="convert-modal">
+  <div class="modal-card" style="max-width:540px">
+    <h3 id="cvm-title">Conversion en cours…</h3>
+    <p id="cvm-current" style="font-family:ui-monospace,monospace;font-size:11px;color:#777;min-height:14px;margin:4px 0 12px">—</p>
+    <div id="cvm-bar-wrap">
+      <div id="cvm-bar"></div>
+    </div>
+    <div id="cvm-stats">
+      <span><b id="cvm-pct">0%</b> · <span id="cvm-progress">0 / 0</span></span>
+      <span>Économisé : <b id="cvm-saved" style="color:#4ade80">0 B</b></span>
+    </div>
+    <div id="cvm-summary" style="display:none"></div>
+    <div class="modal-actions" id="cvm-actions">
+      <button id="cvm-cancel" class="modal-btn-cancel" onclick="cancelConvert()">Annuler</button>
+      <button id="cvm-close"  class="modal-btn-confirm" onclick="closeConvertModal()" style="display:none">Continuer →</button>
+    </div>
   </div>
 </div>
 
@@ -3141,6 +3457,7 @@ function wcRenderSources() {
     ul.appendChild(li);
   });
   document.getElementById('wc-start').disabled = wcState.sources.length === 0;
+  wcUpdateConvertInfo();
 }
 
 function wcRemoveSource(i) {
@@ -3228,6 +3545,117 @@ async function wcReset() {
   wcState.sources = [];
   load();
 }
+
+/* ─── Conversion (welcome) ──────────────────────────────── */
+let _convertPollTimer = null;
+let _convertSelectedPreset = 'none';
+
+function wcGetPreset() {
+  const r = document.querySelector('input[name="wc-preset"]:checked');
+  return r ? r.value : 'none';
+}
+
+function wcUpdateConvertInfo() {
+  _convertSelectedPreset = wcGetPreset();
+  const info = document.getElementById('wc-convert-info');
+  if (!info) return;
+  if (_convertSelectedPreset === 'none' || wcState.sources.length === 0) {
+    info.innerHTML = '';
+    return;
+  }
+  info.innerHTML = `<span>${wcState.sources.length} dossier(s) sélectionné(s) — prêt à compresser</span>` +
+                   `<button onclick="wcStartConvert()">⚡ Compresser maintenant</button>`;
+}
+
+async function wcStartConvert() {
+  const preset = wcGetPreset();
+  if (preset === 'none' || wcState.sources.length === 0) return;
+  const presetLabel = { lossless: 'Sans perte', balanced: 'Équilibré', compact: 'Compact' }[preset];
+
+  openConfirm(
+    `Compression "${presetLabel}" — irréversible`,
+    `Tous les médias des dossiers source vont être remplacés par leur version compressée. Les originaux ne pourront pas être restaurés. Le processus peut prendre plusieurs minutes (vidéos surtout).`,
+    'Lancer la compression',
+    async () => {
+      // Configure la session côté backend just-in-time pour exposer les sources à _collect_convertible_files
+      const cfg = await fetch('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sources: wcState.sources, options: wcState.options }),
+      });
+      const cj = await cfg.json();
+      if (!cj.ok) { showToast(cj.error || 'Erreur config', 'error', 4000); return; }
+
+      const r = await fetch('/api/convert/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preset }),
+      });
+      const j = await r.json();
+      if (!j.ok) { showToast(j.error || 'Erreur de démarrage', 'error', 4000); return; }
+      openConvertModal();
+      pollConvert();
+    },
+    true,
+  );
+}
+
+function openConvertModal() {
+  document.getElementById('cvm-title').textContent  = 'Conversion en cours…';
+  document.getElementById('cvm-summary').style.display = 'none';
+  document.getElementById('cvm-cancel').style.display = '';
+  document.getElementById('cvm-close').style.display  = 'none';
+  document.getElementById('cvm-bar').style.width      = '0%';
+  document.getElementById('cvm-pct').textContent      = '0%';
+  document.getElementById('cvm-progress').textContent = '0 / 0';
+  document.getElementById('cvm-saved').textContent    = '0 B';
+  document.getElementById('cvm-current').textContent  = '—';
+  document.getElementById('convert-modal').classList.add('show');
+}
+
+function closeConvertModal() {
+  document.getElementById('convert-modal').classList.remove('show');
+  if (_convertPollTimer) { clearInterval(_convertPollTimer); _convertPollTimer = null; }
+  // Refresh preview en cas où l'utilisateur reste sur welcome
+  wcUpdateConvertInfo();
+}
+
+async function pollConvert() {
+  if (_convertPollTimer) clearInterval(_convertPollTimer);
+  _convertPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/convert/status');
+      const s = await r.json();
+      document.getElementById('cvm-pct').textContent      = s.percent + '%';
+      document.getElementById('cvm-bar').style.width      = s.percent + '%';
+      document.getElementById('cvm-progress').textContent = `${s.current} / ${s.total}`;
+      document.getElementById('cvm-saved').textContent    = s.bytes_saved_h;
+      document.getElementById('cvm-current').textContent  = s.current_file || '—';
+      if (s.done || !s.running) {
+        clearInterval(_convertPollTimer); _convertPollTimer = null;
+        const errCount = s.errors ? s.errors.length : 0;
+        const verb = s.cancelled ? 'annulée' : 'terminée';
+        document.getElementById('cvm-title').textContent = `Conversion ${verb}`;
+        document.getElementById('cvm-summary').style.display = 'block';
+        document.getElementById('cvm-summary').innerHTML =
+          `<div>Convertis : <b>${s.converted}</b></div>` +
+          `<div>Passés (pas de gain / déjà au format) : ${s.skipped}</div>` +
+          (errCount ? `<div style="color:#f87171">Erreurs : ${errCount}</div>` : '') +
+          `<div style="margin-top:6px">Espace économisé : <b>${s.bytes_saved_h}</b> (sur ${s.bytes_before_h} initialement)</div>`;
+        document.getElementById('cvm-cancel').style.display = 'none';
+        document.getElementById('cvm-close').style.display  = '';
+      }
+    } catch(_) {}
+  }, 1000);
+}
+
+async function cancelConvert() {
+  if (!confirm("Annuler la conversion en cours ? Les fichiers déjà convertis sont conservés.")) return;
+  await fetch('/api/convert/cancel', { method: 'POST' });
+}
+
+/* Quand l'utilisateur change le preset ou ajoute/retire un source, refresh l'info */
+document.addEventListener('change', (e) => {
+  if (e.target && e.target.name === 'wc-preset') wcUpdateConvertInfo();
+});
 
 function wcShow() {
   document.getElementById('welcome').style.display       = 'flex';
