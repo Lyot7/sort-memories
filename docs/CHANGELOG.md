@@ -1,5 +1,37 @@
 # Changelog
 
+## [2026-05-25] v0.5.0 — support HEIC iPhone + formats vidéo étendus
+
+**Type** : Feature
+**Story** : Débloquer la cible iPhone (HEIC = format par défaut iOS 11+) et les vidéos non-Apple
+**Fichiers modifiés** : `sort_memories/core.py`, `pyproject.toml`, `build/SortMemories.spec`, `scripts/build-macos.sh`
+
+**Description** :
+- **`IMAGE_EXT` étendu** : ajout `.heic`, `.heif`, `.tiff`, `.tif`, `.bmp` aux 5 formats existants (jpg/jpeg/png/gif/webp)
+- **`VIDEO_EXT` étendu** : ajout `.m4v`, `.webm`, `.mkv`, `.avi` aux 2 formats existants (mp4/mov)
+- **`MEDIA_EXT` dérivé** : `IMAGE_EXT | VIDEO_EXT` (DRY, fini les sets hardcodés à 3 endroits)
+- **`pillow-heif>=0.16`** ajouté en dépendance + `register_heif_opener()` au top du module pour reads/writes HEIC
+- **`_save_image_in_place(img, p, ext)`** : helper unique pour la sauvegarde post-rotate/crop, gère JPEG, HEIC, formats natifs Pillow
+- **Refactor scan_and_update + scan_clip** : références aux constantes IMAGE_EXT / VIDEO_EXT au lieu de sets hardcodés
+- **PyInstaller spec** : `pillow_heif` ajouté à hiddenimports + binaires dynamiques (libheif/libde265 via cffi)
+- **build-macos.sh** : `pillow-heif` ajouté à l'install pip + `rm -rf` remplacé par `trash` (réversible via corbeille macOS)
+
+**Problèmes rencontrés** : aucun. pillow-heif s'install sans souci sur Apple Silicon, registered hooks Pillow proprement.
+
+**Alternatives considérées** :
+- Convertir HEIC → JPG silencieusement à l'open : rejeté (change l'extension, perd la fidélité, surprend l'user). Préféré : keep HEIC en HEIC via pillow-heif read/write.
+- Inclure dcraw/RAW formats (`.cr2`, `.nef`, `.arw`) : reporté v0.6+ — RAW = workflow photographe pro, hors cible Sort Memories.
+
+**Impact utilisateur** :
+- Les dossiers iPhone (HEIC) sont enfin scannables → cible primaire débloquée
+- Les vidéos WebM (Discord, navigateur), MKV (Plex), M4V (iTunes) ne sont plus silencieusement ignorées
+- Aucun changement breaking sur les datasets existants (cache pHash + state préservés)
+
+**Test plan** :
+- HEIC généré test : open → rotate 90° → save → re-open : dimensions swappées OK ✓
+- Bundle .app v0.5.0 à rebuild via `scripts/build-macos.sh`
+- Test manuel à venir : dossier iPhone mixte (HEIC + MOV + JPG/PNG d'export) → scan + dedup + tri
+
 ## [2026-05-24] v0.4.0 — compression pré-triage (WebP + H.265)
 
 **Type** : Feature

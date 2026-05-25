@@ -18,7 +18,13 @@ hiddenimports += collect_submodules("flask")
 hiddenimports += collect_submodules("webview")
 hiddenimports += collect_submodules("sort_memories")
 hiddenimports += collect_submodules("send2trash")
-hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash"]
+hiddenimports += collect_submodules("pillow_heif")
+hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash", "pillow_heif"]
+
+# pillow_heif ship des .dylib via cffi — collecte les binaires
+from PyInstaller.utils.hooks import collect_dynamic_libs
+binaries = []
+binaries += collect_dynamic_libs("pillow_heif")
 
 datas = []
 datas += collect_data_files("webview")
@@ -42,7 +48,7 @@ excludes = [
 a = Analysis(
     [_APP_ENTRY],
     pathex=[_PROJECT_ROOT],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -87,12 +93,12 @@ app = BUNDLE(
     name="Sort Memories.app",
     icon=None,
     bundle_identifier="fr.eliottbouquerel.sortmemories",
-    version="0.4.0",
+    version="0.5.0",
     info_plist={
         "CFBundleName": "Sort Memories",
         "CFBundleDisplayName": "Sort Memories",
-        "CFBundleVersion": "0.4.0",
-        "CFBundleShortVersionString": "0.4.0",
+        "CFBundleVersion": "0.5.0",
+        "CFBundleShortVersionString": "0.5.0",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
         "NSHumanReadableCopyright": "© 2026 Eliott Bouquerel. Tous droits réservés.",

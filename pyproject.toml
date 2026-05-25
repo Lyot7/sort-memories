@@ -1,16 +1,17 @@
 [project]
 name = "sort-memories"
-version = "0.4.0"
+version = "0.5.0"
 description = "Desktop app to sort and dedupe local media folders (macOS, soon multi-platform)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Eliott Bouquerel" }]
-keywords = ["media", "sort", "dedupe", "photo", "video", "macos", "desktop", "clip", "phash"]
+keywords = ["media", "sort", "dedupe", "photo", "video", "heic", "macos", "desktop", "clip", "phash"]
 
 dependencies = [
     "flask>=3.0",
     "pillow>=10.0",
+    "pillow-heif>=0.16",
     "imagehash>=4.3",
     "numpy>=1.26",
     "torch>=2.2",
