@@ -40,7 +40,7 @@
 
 ## Fait récemment
 
-- [x] **v0.5.0 — support HEIC iPhone + formats vidéo étendus** (2026-05-25)
+- [x] **v0.5.0 — support HEIC iPhone + formats vidéo étendus + auto-update intégré** (2026-05-25)
 - [x] v0.4.0 — compression pré-triage WebP + H.265 (2026-05-24)
 - [x] v0.3.0 — rotation T, crop/trim R, vider corbeille send2trash (2026-05-23)
 - [x] v0.2.0 — vue accueil + multi-source + options de tri (2026-05-22)

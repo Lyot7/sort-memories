@@ -41,6 +41,8 @@ try:
 except ImportError:
     CLIP_AVAILABLE = False
 
+from sort_memories import updater as _updater
+
 # ── Répertoires ──────────────────────────────────────────────────────────────
 # MEDIA_DIR  = dossier source à trier (sélectionné par l'utilisateur au lancement)
 # STATE_DIR  = répertoire d'état (cache pHash, embeddings CLIP, état triage, licence)
@@ -2087,6 +2089,122 @@ def api_reorganize():
                     "message": "Les actions sont appliquées immédiatement depuis v0.2.0."}), 410
 
 # ──────────────────────────────────────────────────────────────────────────────
+# AUTO-UPDATE (v0.5.0+)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_update_lock = threading.Lock()
+_update_state = {
+    "checked":     False,        # True dès qu'un check (réussi ou non) a été fait
+    "checking":    False,        # True pendant le fetch GitHub API
+    "ok":          False,        # True si le dernier check a abouti
+    "current":     "",           # version courante
+    "latest":      None,         # tag de la dernière release
+    "available":   False,        # update dispo ?
+    "url":         None,         # URL du zip
+    "size":        None,         # bytes
+    "notes":       "",           # release notes
+    "error":       None,         # message d'erreur si check a échoué
+    "downloading": False,        # download en cours
+    "dl_done":     0,            # bytes téléchargés
+    "dl_total":    0,            # total bytes
+    "installing":  False,        # extract + relauncher en cours
+    "install_err": None,         # erreur d'install
+}
+
+def _do_check_update():
+    """Worker : appelle l'API GitHub et met à jour _update_state."""
+    with _update_lock:
+        _update_state["checking"] = True
+        _update_state["error"]    = None
+    try:
+        result = _updater.check_latest()
+    except Exception as e:
+        with _update_lock:
+            _update_state["checking"] = False
+            _update_state["checked"]  = True
+            _update_state["ok"]       = False
+            _update_state["error"]    = f"Exception: {str(e)[:120]}"
+        return
+    with _update_lock:
+        _update_state.update({
+            "checking":  False,
+            "checked":   True,
+            "ok":        result["ok"],
+            "current":   result["current"],
+            "latest":    result["latest"],
+            "available": result["available"],
+            "url":       result["url"],
+            "size":      result["size"],
+            "notes":     result["notes"],
+            "error":     result["error"],
+        })
+
+def _kickoff_startup_check():
+    """À appeler depuis app.py au démarrage : check silencieux en thread daemon."""
+    t = threading.Thread(target=_do_check_update, daemon=True, name="update-check")
+    t.start()
+
+def _do_install_update():
+    """Worker : download + extract + relauncher + sys.exit. NE REVIENT JAMAIS."""
+    with _update_lock:
+        url = _update_state["url"]
+    if not url:
+        with _update_lock:
+            _update_state["installing"]  = False
+            _update_state["install_err"] = "URL de téléchargement manquante (relancez la vérification)."
+        return
+
+    def progress(done, total):
+        with _update_lock:
+            _update_state["dl_done"]  = done
+            _update_state["dl_total"] = total
+
+    try:
+        with _update_lock:
+            _update_state["downloading"] = True
+            _update_state["installing"]  = True
+            _update_state["install_err"] = None
+        zip_path = Path(tempfile.gettempdir()) / "sort-memories-update.zip"
+        _updater.download_release(url, zip_path, progress_cb=progress)
+        with _update_lock:
+            _update_state["downloading"] = False
+        # install_release ne revient pas (os._exit)
+        _updater.install_release(zip_path)
+    except Exception as e:
+        with _update_lock:
+            _update_state["downloading"] = False
+            _update_state["installing"]  = False
+            _update_state["install_err"] = str(e)[:200]
+
+@app.route("/api/update/check", methods=["POST"])
+def api_update_check():
+    """Déclenche un check (async). L'UI poll /api/update/status."""
+    with _update_lock:
+        if _update_state["checking"] or _update_state["installing"]:
+            return jsonify({"ok": False, "busy": True}), 409
+    t = threading.Thread(target=_do_check_update, daemon=True, name="update-check-manual")
+    t.start()
+    return jsonify({"ok": True, "triggered": True})
+
+@app.route("/api/update/status", methods=["GET"])
+def api_update_status():
+    """État courant de l'updater (check + download + install). Poll-friendly."""
+    with _update_lock:
+        return jsonify(dict(_update_state))
+
+@app.route("/api/update/install", methods=["POST"])
+def api_update_install():
+    """Déclenche le download + install + relauncher. L'app va quitter."""
+    with _update_lock:
+        if not _update_state.get("available") or not _update_state.get("url"):
+            return jsonify({"ok": False, "error": "Aucune mise à jour disponible."}), 400
+        if _update_state["installing"] or _update_state["downloading"]:
+            return jsonify({"ok": False, "busy": True}), 409
+    t = threading.Thread(target=_do_install_update, daemon=True, name="update-install")
+    t.start()
+    return jsonify({"ok": True, "triggered": True})
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PAGE HTML
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -2435,6 +2553,31 @@ PAGE = r"""<!DOCTYPE html>
   .wc-convert-info button:hover { background: rgba(251,146,60,.25); }
   .wc-convert-info button:disabled { background: #1a1a1a; color: #555; border-color: #2a2a2a; cursor: not-allowed; }
 
+  /* Mises à jour (welcome view) */
+  .wc-update-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: #ccc; }
+  .wc-update-current b { color: #ddd; font-weight: 600; }
+  .wc-update-btn {
+    background: #1a1a1a; border: 1px solid #333; color: #ccc;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  .wc-update-btn:hover { border-color: #555; background: #222; }
+  .wc-update-btn:disabled { color: #555; cursor: not-allowed; }
+  .wc-update-banner {
+    margin-top: 12px; padding: 12px 14px; border-radius: 8px;
+    background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35);
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .wc-update-banner-text { display: flex; align-items: center; gap: 12px; }
+  .wc-update-emoji { font-size: 22px; }
+  .wc-update-banner-text b { color: #e9e2ff; font-size: 13px; }
+  .wc-update-btn-primary {
+    background: rgba(167,139,250,.18); border: 1px solid rgba(167,139,250,.5); color: #c4b5fd;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .wc-update-btn-primary:hover { background: rgba(167,139,250,.3); }
+  .wc-update-btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+
   #cvm-bar-wrap {
     background: #0a0a0a; border-radius: 4px; height: 8px; overflow: hidden; margin: 14px 0 10px;
   }
@@ -2638,8 +2781,46 @@ PAGE = r"""<!DOCTYPE html>
       <div id="wc-convert-info" class="wc-convert-info"></div>
     </section>
 
+    <section class="wc-section">
+      <label>Mises à jour</label>
+      <div class="wc-update-row">
+        <span class="wc-update-current">Version installée : <b id="wc-current-version">v?.?.?</b></span>
+        <button id="wc-check-update" class="wc-update-btn" onclick="checkForUpdate(true)">Vérifier maintenant</button>
+      </div>
+      <div id="wc-update-banner" class="wc-update-banner" style="display:none">
+        <div class="wc-update-banner-text">
+          <span class="wc-update-emoji">🎉</span>
+          <div>
+            <b>Nouvelle version disponible : <span id="wc-update-latest">vX.Y.Z</span></b>
+            <p class="wc-hint" id="wc-update-size"></p>
+          </div>
+        </div>
+        <button id="wc-install-update" class="wc-update-btn-primary" onclick="installUpdate()">Mettre à jour →</button>
+      </div>
+      <p id="wc-update-msg" class="wc-hint"></p>
+    </section>
+
     <button id="wc-start" onclick="wcStart()" disabled>Démarrer le triage →</button>
     <p id="wc-error" class="wc-err"></p>
+  </div>
+</div>
+
+<!-- Modal téléchargement mise à jour -->
+<div class="modal-back" id="update-modal">
+  <div class="modal-card" style="max-width:480px">
+    <h3 id="um-title">Téléchargement en cours…</h3>
+    <p class="wc-hint" id="um-detail">Sort Memories va se relancer automatiquement dès que l'installation est terminée.</p>
+    <div id="cvm-bar-wrap" style="margin-top:16px">
+      <div id="um-bar" style="height:100%;width:0%;background:#a78bfa;border-radius:6px;transition:width .2s"></div>
+    </div>
+    <div id="cvm-stats" style="margin-top:8px">
+      <span><b id="um-pct">0%</b></span>
+      <span id="um-bytes">0 / 0 MB</span>
+    </div>
+    <p id="um-error" style="color:#f87171;font-size:12px;margin-top:12px;display:none"></p>
+    <div class="modal-actions">
+      <button id="um-cancel" class="modal-btn-cancel" onclick="closeUpdateModal()" style="display:none">Fermer</button>
+    </div>
   </div>
 </div>
 
@@ -4069,8 +4250,167 @@ document.addEventListener('keydown', (e) => {
   }, 800);
 })();
 
+/* ─── Auto-update (v0.5.0+) ─────────────────────────────── */
+
+function fmtMB(bytes) {
+  if (!bytes) return '0 MB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function initUpdateUI() {
+  // Affiche la version courante sans attendre le check
+  try {
+    const r = await fetch('/api/update/status');
+    const s = await r.json();
+    const v = document.getElementById('wc-current-version');
+    if (v && s.current) v.textContent = 'v' + s.current;
+  } catch (e) { /* silent */ }
+
+  // Check silencieux au démarrage : 1s après load pour ne pas bloquer le boot
+  setTimeout(() => checkForUpdate(false), 1000);
+}
+
+async function checkForUpdate(verbose) {
+  const btn  = document.getElementById('wc-check-update');
+  const msg  = document.getElementById('wc-update-msg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Vérification…'; }
+  if (verbose && msg) msg.textContent = '';
+
+  try {
+    await fetch('/api/update/check', { method: 'POST' });
+  } catch (e) {
+    if (msg) msg.textContent = 'Connexion impossible.';
+    if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+    return;
+  }
+
+  // Poll status jusqu'à fin du check
+  let tries = 0;
+  const poll = async () => {
+    tries++;
+    let s;
+    try {
+      const r = await fetch('/api/update/status');
+      s = await r.json();
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+      return;
+    }
+    if (s.checking && tries < 30) {
+      setTimeout(poll, 500);
+      return;
+    }
+    renderUpdateState(s, verbose);
+  };
+  poll();
+}
+
+function renderUpdateState(s, verbose) {
+  const btn    = document.getElementById('wc-check-update');
+  const msg    = document.getElementById('wc-update-msg');
+  const banner = document.getElementById('wc-update-banner');
+  const latest = document.getElementById('wc-update-latest');
+  const size   = document.getElementById('wc-update-size');
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+
+  if (!s.ok) {
+    if (msg) msg.textContent = s.error || 'Vérification impossible.';
+    if (banner) banner.style.display = 'none';
+    return;
+  }
+
+  if (s.available) {
+    if (latest) latest.textContent = s.latest || '';
+    if (size)   size.textContent   = s.size ? `Taille : ${fmtMB(s.size)}` : '';
+    if (banner) banner.style.display = 'flex';
+    if (msg) msg.textContent = '';
+  } else {
+    if (banner) banner.style.display = 'none';
+    if (msg && verbose) msg.textContent = `Vous avez la dernière version (v${s.current}).`;
+  }
+}
+
+async function installUpdate() {
+  const installBtn = document.getElementById('wc-install-update');
+  if (installBtn) installBtn.disabled = true;
+
+  // Ouvre le modal
+  document.getElementById('update-modal').classList.add('on');
+  document.getElementById('um-error').style.display = 'none';
+  document.getElementById('um-cancel').style.display = 'none';
+  document.getElementById('um-bar').style.width = '0%';
+  document.getElementById('um-pct').textContent = '0%';
+  document.getElementById('um-bytes').textContent = '0 / 0 MB';
+  document.getElementById('um-title').textContent = 'Téléchargement en cours…';
+
+  try {
+    const r = await fetch('/api/update/install', { method: 'POST' });
+    const j = await r.json();
+    if (!j.ok) {
+      showUpdateError(j.error || 'Erreur de déclenchement');
+      return;
+    }
+  } catch (e) {
+    showUpdateError('Connexion impossible.');
+    return;
+  }
+
+  // Poll download progress
+  const poll = async () => {
+    let s;
+    try {
+      const r = await fetch('/api/update/status');
+      s = await r.json();
+    } catch (e) {
+      showUpdateError('Connexion perdue pendant le téléchargement.');
+      return;
+    }
+
+    if (s.install_err) {
+      showUpdateError(s.install_err);
+      return;
+    }
+
+    if (s.downloading || s.installing) {
+      const total = s.dl_total || 0;
+      const done  = s.dl_done  || 0;
+      const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
+      document.getElementById('um-bar').style.width = pct + '%';
+      document.getElementById('um-pct').textContent = pct + '%';
+      document.getElementById('um-bytes').textContent = fmtMB(done) + ' / ' + fmtMB(total);
+      if (!s.downloading && s.installing) {
+        document.getElementById('um-title').textContent = 'Installation en cours…';
+        document.getElementById('um-detail').textContent = 'Sort Memories va se relancer dans un instant.';
+      }
+      setTimeout(poll, 400);
+      return;
+    }
+
+    // Si on arrive ici sans erreur, c'est que l'install s'est faite (l'app va quitter)
+    // mais comme l'app peut prendre 1-2s avant os._exit, on continue à poll
+    setTimeout(poll, 500);
+  };
+  poll();
+}
+
+function showUpdateError(msg) {
+  document.getElementById('um-title').textContent = 'Échec de la mise à jour';
+  const err = document.getElementById('um-error');
+  err.textContent = msg;
+  err.style.display = '';
+  document.getElementById('um-cancel').style.display = '';
+  const installBtn = document.getElementById('wc-install-update');
+  if (installBtn) installBtn.disabled = false;
+}
+
+function closeUpdateModal() {
+  document.getElementById('update-modal').classList.remove('on');
+}
+
 load();
 updateTrashBadge();
+initUpdateUI();
 </script>
 </body>
 </html>"""

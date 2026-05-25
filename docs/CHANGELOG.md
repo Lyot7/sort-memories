@@ -1,36 +1,43 @@
 # Changelog
 
-## [2026-05-25] v0.5.0 — support HEIC iPhone + formats vidéo étendus
+## [2026-05-25] v0.5.0 — support HEIC iPhone + formats vidéo étendus + auto-update
 
 **Type** : Feature
-**Story** : Débloquer la cible iPhone (HEIC = format par défaut iOS 11+) et les vidéos non-Apple
-**Fichiers modifiés** : `sort_memories/core.py`, `pyproject.toml`, `build/SortMemories.spec`, `scripts/build-macos.sh`
+**Story** : Débloquer la cible iPhone + supprimer la friction "réinstaller à chaque release"
+**Fichiers modifiés** : `sort_memories/core.py`, `sort_memories/updater.py` (nouveau), `pyproject.toml`, `build/SortMemories.spec`, `scripts/build-macos.sh`, `README.md`
 
-**Description** :
-- **`IMAGE_EXT` étendu** : ajout `.heic`, `.heif`, `.tiff`, `.tif`, `.bmp` aux 5 formats existants (jpg/jpeg/png/gif/webp)
-- **`VIDEO_EXT` étendu** : ajout `.m4v`, `.webm`, `.mkv`, `.avi` aux 2 formats existants (mp4/mov)
-- **`MEDIA_EXT` dérivé** : `IMAGE_EXT | VIDEO_EXT` (DRY, fini les sets hardcodés à 3 endroits)
-- **`pillow-heif>=0.16`** ajouté en dépendance + `register_heif_opener()` au top du module pour reads/writes HEIC
-- **`_save_image_in_place(img, p, ext)`** : helper unique pour la sauvegarde post-rotate/crop, gère JPEG, HEIC, formats natifs Pillow
-- **Refactor scan_and_update + scan_clip** : références aux constantes IMAGE_EXT / VIDEO_EXT au lieu de sets hardcodés
+### Auto-update (nouveau)
+- **Module `sort_memories/updater.py`** : check GitHub Releases API, download zip, génère un script bash relauncher qui swap le `.app` et relance
+- **3 endpoints Flask** : `GET /api/update/status`, `POST /api/update/check`, `POST /api/update/install`
+- **UI welcome view** : nouvelle section "Mises à jour" avec version actuelle + bouton "Vérifier maintenant" + banner violet si une release est dispo
+- **Check silencieux au démarrage** (1s après load, non bloquant)
+- **Modal progression** avec barre + bytes téléchargés
+- **Sécurité** : HTTPS strict (ssl.create_default_context), User-Agent identifié, vérif que le zip contient bien Sort Memories.app à la racine, swap atomique via `ditto`, ancien .app envoyé à la corbeille (réversible)
+- **Fallback** : si `trash` n'est pas dispo chez l'user final, `mv` vers `~/.Trash` manuellement
+
+### Support HEIC + formats étendus
+- **`IMAGE_EXT`** : ajout `.heic`, `.heif`, `.tiff`, `.tif`, `.bmp` (avant : jpg/jpeg/png/gif/webp uniquement)
+- **`VIDEO_EXT`** : ajout `.m4v`, `.webm`, `.mkv`, `.avi` (avant : mp4/mov uniquement)
+- **`MEDIA_EXT`** : dérivé `IMAGE_EXT | VIDEO_EXT` (DRY, fin des sets hardcodés à 3 endroits)
+- **`pillow-heif>=0.16`** ajouté en dépendance + `register_heif_opener()` au top du module
+- **`_save_image_in_place()`** : helper unique pour sauvegarde post-rotate/crop, gère JPEG, HEIC, formats natifs Pillow
 - **PyInstaller spec** : `pillow_heif` ajouté à hiddenimports + binaires dynamiques (libheif/libde265 via cffi)
-- **build-macos.sh** : `pillow-heif` ajouté à l'install pip + `rm -rf` remplacé par `trash` (réversible via corbeille macOS)
 
-**Problèmes rencontrés** : aucun. pillow-heif s'install sans souci sur Apple Silicon, registered hooks Pillow proprement.
-
-**Alternatives considérées** :
-- Convertir HEIC → JPG silencieusement à l'open : rejeté (change l'extension, perd la fidélité, surprend l'user). Préféré : keep HEIC en HEIC via pillow-heif read/write.
-- Inclure dcraw/RAW formats (`.cr2`, `.nef`, `.arw`) : reporté v0.6+ — RAW = workflow photographe pro, hors cible Sort Memories.
+**Tests** :
+- HEIC end-to-end : génération → rotation 90° → save HEIF → re-open : dimensions swappées OK ✓
+- Auto-update endpoints (Flask test client) : status / check / install bloqué si pas d'update dispo ✓
+- Bundle .app rebuild v0.5.0 + smoke test launch ✓
 
 **Impact utilisateur** :
 - Les dossiers iPhone (HEIC) sont enfin scannables → cible primaire débloquée
 - Les vidéos WebM (Discord, navigateur), MKV (Plex), M4V (iTunes) ne sont plus silencieusement ignorées
+- **Plus besoin de réinstaller manuellement** : un clic depuis la page d'accueil suffit
 - Aucun changement breaking sur les datasets existants (cache pHash + state préservés)
 
-**Test plan** :
-- HEIC généré test : open → rotate 90° → save → re-open : dimensions swappées OK ✓
-- Bundle .app v0.5.0 à rebuild via `scripts/build-macos.sh`
-- Test manuel à venir : dossier iPhone mixte (HEIC + MOV + JPG/PNG d'export) → scan + dedup + tri
+**Alternatives considérées** :
+- Convertir HEIC → JPG silencieusement : rejeté (change l'extension, perd la fidélité). Préféré : keep HEIC en HEIC via pillow-heif read/write.
+- Sparkle framework pour l'auto-update : rejeté (overhead Objective-C/Swift pour app Python). Préféré : updater Python custom + script bash relauncher.
+- Inclure RAW formats (`.cr2`, `.nef`, `.arw`) : reporté v0.6+ (workflow photographe pro, hors cible).
 
 ## [2026-05-24] v0.4.0 — compression pré-triage (WebP + H.265)
 
