@@ -18,6 +18,15 @@ from PIL import Image
 import imagehash
 from flask import Flask, request, jsonify, send_file, render_template_string
 
+# Enregistre les handlers HEIC/HEIF (format par défaut iPhone depuis iOS 11).
+# Sans ça, Pillow ne sait pas ouvrir ni écrire les fichiers .heic/.heif.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIF_AVAILABLE = True
+except ImportError:
+    HEIF_AVAILABLE = False
+
 try:
     import appdirs
     _STATE_DEFAULT = Path(appdirs.user_data_dir("SortMemories", "EliottBouquerel"))
@@ -54,7 +63,17 @@ _NS_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE     = _NS_DIR / "triage_state.json"
 CACHE_FILE     = _NS_DIR / "dedupe_cache.json"
 GROUPS_FILE    = _NS_DIR / "dedupe_groups.json"
-MEDIA_EXT      = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov"}
+
+# Formats supportés. IMAGE_EXT inclut HEIC/HEIF (iPhone), TIFF, BMP en plus des
+# formats web. VIDEO_EXT inclut M4V (iTunes), WebM, MKV, AVI. MEDIA_EXT dérivé.
+IMAGE_EXT      = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".tiff", ".tif", ".bmp"}
+VIDEO_EXT      = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+MEDIA_EXT      = IMAGE_EXT | VIDEO_EXT
+
+# Formats pour lesquels Pillow peut écrire en gardant l'extension d'origine.
+# Les autres (.heic/.heif via pillow-heif) sont gérés à part dans _do_rotate/_do_crop.
+PIL_NATIVE_WRITE = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".tif", ".bmp"}
+
 HASH_THRESHOLD = 10   # distance Hamming ≤ 10/64 bits (~15%) — couvre ré-encodage, resize, changement format
 VIDEO_FRAMES   = 5
 VIDEO_MATCH    = 3    # frames minimum correspondantes sur VIDEO_FRAMES
@@ -67,8 +86,6 @@ app = Flask(__name__)
 # retourne vide.
 
 SESSION_FILE = STATE_DIR / "session.json"
-IMAGE_EXT    = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-VIDEO_EXT    = {".mp4", ".mov"}
 
 DEFAULT_OPTIONS = {
     "by_year":     True,
@@ -824,11 +841,11 @@ def scan_and_update():
                 entry = {"mtime": stat.st_mtime, "size": stat.st_size}
                 ext   = p.suffix.lower()
                 try:
-                    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                    if ext in IMAGE_EXT:
                         h, res              = compute_image_hash(p)
                         entry["hash"]       = h
                         entry["resolution"] = res
-                    elif ext in {".mp4", ".mov"}:
+                    elif ext in VIDEO_EXT:
                         entry["video_hashes"] = compute_video_hash(p)
                 except Exception:
                     pass
@@ -874,7 +891,7 @@ def scan_clip():
             raise RuntimeError("Impossible de charger ViT-L/14")
 
         img_files = [f for f in all_scannable_files()
-                     if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}]
+                     if f.suffix.lower() in IMAGE_EXT]
 
         with _clip_lock:
             _clip_scan_status["total"] = len(img_files)
@@ -1629,6 +1646,23 @@ def api_transform():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+def _save_image_in_place(img: Image.Image, p: Path, ext: str):
+    """Sauvegarde img au chemin p en respectant le format d'origine.
+
+    JPEG/HEIC nécessitent un mode RGB sans alpha. Les autres formats Pillow-natifs
+    sont sauvés directement. HEIC/HEIF requiert pillow-heif registered (HEIF_AVAILABLE).
+    """
+    if ext in (".jpg", ".jpeg"):
+        img = img.convert("RGB")
+        img.save(str(p), "JPEG", quality=95, subsampling=0)
+    elif ext in (".heic", ".heif"):
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(str(p), format="HEIF", quality=90)
+    else:
+        img.save(str(p))
+
+
 def _do_rotate(p: Path, angle: int):
     """Rotation horaire de l'angle donné (90, 180, 270). In-place."""
     ext = p.suffix.lower()
@@ -1643,11 +1677,7 @@ def _do_rotate(p: Path, angle: int):
             rotated = img.transpose(Image.Transpose.ROTATE_90)
         else:
             return jsonify({"ok": False, "error": "angle doit être 90/180/270"}), 400
-        if ext in (".jpg", ".jpeg"):
-            rotated = rotated.convert("RGB")
-            rotated.save(str(p), "JPEG", quality=95, subsampling=0)
-        else:
-            rotated.save(str(p))
+        _save_image_in_place(rotated, p, ext)
         return jsonify({"ok": True, "kind": "image", "angle": angle})
 
     if ext in VIDEO_EXT:
@@ -1683,11 +1713,7 @@ def _do_crop(p: Path, x: int, y: int, w: int, h: int):
     if right - left < 4 or bottom - top < 4:
         return jsonify({"ok": False, "error": "zone de crop trop petite"}), 400
     cropped = img.crop((left, top, right, bottom))
-    if ext in (".jpg", ".jpeg"):
-        cropped = cropped.convert("RGB")
-        cropped.save(str(p), "JPEG", quality=95, subsampling=0)
-    else:
-        cropped.save(str(p))
+    _save_image_in_place(cropped, p, ext)
     return jsonify({"ok": True, "kind": "image",
                     "crop": {"x": left, "y": top, "w": right - left, "h": bottom - top}})
 
