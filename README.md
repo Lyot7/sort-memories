@@ -20,11 +20,12 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 - 🗑 **Vider la corbeille** : bouton qui envoie tous les `Tri/Supprimées/` à la Corbeille macOS (réversible)
 - ↶ **Undo** : `←` revient en arrière sans perdre l'état (keep et delete réversibles)
 - 🔍 **Déduplication pHash** : détecte les copies exactes ou re-encodées (resize, conversion JPG↔PNG, etc.)
-- 🎬 **Support vidéo** : MP4/MOV (rotation, trim, dedupe par frames)
+- 📸 **Formats image étendus** (v0.5.0) : JPG, PNG, GIF, WebP, **HEIC/HEIF** (iPhone), TIFF, BMP
+- 🎬 **Formats vidéo étendus** (v0.5.0) : MP4, MOV, M4V, WebM, MKV, AVI — rotation, trim, dedupe par frames
 - 💾 **100% local** : aucun upload, aucune télémétrie, aucune dépendance cloud
 - ⏯️ **Reprise de session** : ferme et reprends quand tu veux, l'état est sauvegardé par config (sources × options)
-- 📦 **Compression pré-triage** : convertit JPG/PNG en WebP et MP4/MOV en H.265 avant tri. 3 presets (Sans perte / Équilibré / Compact). Gain disque ~30-90% selon preset.
-- 🔜 **Recherche sémantique CLIP** : prévue pour v0.5.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
+- 📦 **Compression pré-triage** : convertit images en WebP et vidéos en H.265 avant tri. 3 presets (Sans perte / Équilibré / Compact). Gain disque ~30-90% selon preset.
+- 🔜 **Recherche sémantique CLIP** : prévue pour v0.6+ (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
 
 ## Installation
 
@@ -32,9 +33,9 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 
 **Téléchargement direct** : [dernière release](https://github.com/Lyot7/sort-memories/releases/latest) → `SortMemories-macos-vX.Y.Z.zip` → décompresse → glisse `Sort Memories.app` dans `/Applications`.
 
-### ⚠️ Première ouverture sur macOS (v0.1.x — non encore notarisée)
+### ⚠️ Première ouverture sur macOS (v0.5.x — pas encore signée Apple)
 
-La v0.1.x n'est pas signée Apple Developer ID. Au premier lancement, macOS Gatekeeper affiche : *"« Sort Memories » ne peut pas être ouvert car Apple n'a pas pu vérifier qu'il ne contenait pas de logiciel malveillant"* avec uniquement *Placer dans la corbeille* / *Terminé*.
+Tant que l'app n'est pas signée Apple Developer ID + notarisée (prévu pour la version commerciale T2 2026), macOS Gatekeeper affiche au premier lancement : *"« Sort Memories » ne peut pas être ouvert car Apple n'a pas pu vérifier qu'il ne contenait pas de logiciel malveillant"* avec uniquement *Placer dans la corbeille* / *Terminé*.
 
 **Méthode rapide (Terminal, 1 commande)** :
 
@@ -53,7 +54,7 @@ Cette commande retire le flag de quarantaine que macOS pose sur tout fichier té
 
 Sur macOS Sonoma+/Sequoia, le *clic-droit > Ouvrir* ne suffit plus pour les apps téléchargées via navigateur — passer obligatoirement par l'une des deux méthodes ci-dessus.
 
-Signature Apple Developer ID + notarisation arrivent en v0.2.0 — ces étapes disparaîtront définitivement.
+Signature Apple Developer ID + notarisation arrivent avec la version commerciale (T2 2026) — ces étapes disparaîtront définitivement.
 
 ## Tarification
 
@@ -69,19 +70,22 @@ Signature Apple Developer ID + notarisation arrivent en v0.2.0 — ces étapes d
 5. Les fichiers gardés sont rangés dans `<dossier>/Gardés/<année>/`
 6. Les fichiers à virer atterrissent dans `<dossier>/_a_supprimer/` — videz-le dans la corbeille macOS quand tout est trié
 
-**Note v0.1.0** : la recherche sémantique CLIP n'est PAS bundlée (gain de 2 GB sur le téléchargement). Elle arrivera en v0.2.0 — soit en bundle complet, soit téléchargée à la demande. La détection de doublons pHash, elle, est entièrement fonctionnelle.
+**Note** : la recherche sémantique CLIP n'est PAS bundlée (gain de 2 GB sur le téléchargement). Elle arrivera en v0.6+ — téléchargée à la demande au premier usage. La détection de doublons pHash, elle, est entièrement fonctionnelle.
 
 ## Roadmap
 
 - [x] Prototype Flask + UI web (utilisé en interne pour trier le dossier Snapchat de l'auteur)
 - [x] Wrapper pywebview → `.app` macOS natif (v0.1.0)
 - [x] Build PyInstaller + release GitHub (v0.1.0)
-- [ ] Recherche sémantique CLIP bundlée ou downloadable on-demand (v0.2.0)
-- [ ] Signature + notarisation Apple (Developer ID) (v0.2.0)
-- [ ] CI/CD GitHub Actions (build .dmg sur tag, runner macos-14)
-- [ ] Backend de licence (vérification clé en ligne, grace period 30j)
-- [ ] Landing page + screenshots/GIF démo
-- [ ] Port Linux / Windows (post-commercialisation)
+- [x] Vue accueil + multi-source + options de tri (v0.2.0)
+- [x] Rotation T, crop/trim R, vider corbeille send2trash (v0.3.0)
+- [x] Compression pré-triage WebP + H.265, 3 presets (v0.4.0)
+- [x] Support HEIC iPhone + formats vidéo étendus (v0.5.0)
+- [ ] Signature + notarisation Apple Developer ID — version commerciale T2 2026
+- [ ] Landing site + LemonSqueezy paywall + trial server-side — version commerciale T2 2026
+- [ ] CI/CD GitHub Actions (build .dmg sur tag, runner macos-14) — version commerciale T2 2026
+- [ ] Recherche sémantique CLIP downloadable on-demand (v0.6+)
+- [ ] Port Linux / Windows (post-validation produit-marché)
 
 ## Stack technique
 
