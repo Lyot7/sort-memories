@@ -1,11 +1,21 @@
 # État actuel du projet
 
-**Dernière mise à jour** : 2026-05-25
+**Dernière mise à jour** : 2026-06-04
 
 ## En cours
 
-- [ ] **Rebuild + test manuel v0.5.0** — `./scripts/build-macos.sh` puis test sur dossier iPhone (HEIC + MOV)
-- [ ] **Roadmap commerciale macOS** (cf. `~/.claude/plans/en-vrai-l-application-est-drifting-avalanche.md`)
+v0.6.0 implémentée (tous formats + métadonnées préservées + tri par volume), mergée au-dessus de la v0.5.0 (HEIC + auto-update). Vérifiée par tests sur fixtures. Reste : rebuild du `.app` (`./scripts/build-macos.sh`) + test manuel sur dossier iPhone (HEIC + MOV) avant release. Roadmap commerciale macOS : cf. `~/.claude/plans/en-vrai-l-application-est-drifting-avalanche.md`.
+
+## Fait récemment (v0.6.0)
+
+- [x] **Tous formats** photo (HEIC/HEIF/AVIF/TIFF/BMP/RAW) + vidéo (AVI/MKV/M4V/WMV/3GP/MTS/WEBM…) sur toute l'app
+- [x] **Métadonnées préservées** à la compression (EXIF/ICC/XMP sur WebP, `-map_metadata` sur H.265, `os.utime` mtime)
+- [x] **Année fiable** via `_capture_datetime` (EXIF/creation_time/nom/mtime) — corrige le bug « tout en 2026 »
+- [x] **Rangement par vraie date** de capture (`compute_keep_destination`)
+- [x] **Endpoint `/preview`** JPEG pour formats non rendus par WKWebView (RAW, AVI/MKV…)
+- [x] **Tri par volume** : option de file `order=largest` + galerie triable `/api/gallery`
+- [x] deps `pillow-heif`/`rawpy`/`exifread` + spec PyInstaller (libheif/libraw bundlés)
+- [x] Merge de `feat/v0.5.0-heic-formats` (auto-update + HEIC) dans la branche v0.6.0
 
 ## À faire (v0.5.x — commercialisation macOS)
 
@@ -40,7 +50,7 @@
 
 ## Fait récemment
 
-- [x] **v0.5.0 — support HEIC iPhone + formats vidéo étendus** (2026-05-25)
+- [x] **v0.5.0 — support HEIC iPhone + formats vidéo étendus + auto-update intégré** (2026-05-25)
 - [x] v0.4.0 — compression pré-triage WebP + H.265 (2026-05-24)
 - [x] v0.3.0 — rotation T, crop/trim R, vider corbeille send2trash (2026-05-23)
 - [x] v0.2.0 — vue accueil + multi-source + options de tri (2026-05-22)

@@ -10,22 +10,57 @@ Configuration (env vars) :
 - SORT_MEMORIES_MEDIA_DIR : dossier source à trier (obligatoire en production)
 - SORT_MEMORIES_STATE_DIR : override du répertoire d'état (par défaut appdirs)
 """
-import json, os, shutil, threading, webbrowser, subprocess, tempfile
-from pathlib import Path
-from itertools import combinations
+import datetime as _datetime
+import json
+import os
+import re as _re
+import shutil
+import subprocess
+import tempfile
+import threading
+import webbrowser
 from collections import defaultdict
-from PIL import Image
-import imagehash
-from flask import Flask, request, jsonify, send_file, render_template_string
+from itertools import combinations
+from pathlib import Path
 
-# Enregistre les handlers HEIC/HEIF (format par défaut iPhone depuis iOS 11).
-# Sans ça, Pillow ne sait pas ouvrir ni écrire les fichiers .heic/.heif.
+import imagehash
+from flask import Flask, jsonify, render_template_string, request, send_file
+from PIL import Image
+
+# HEIC/HEIF/AVIF — enregistre les openers Pillow (iPhone, format par défaut depuis
+# iOS 11). Sans ça, Image.open échoue sur .heic et l'écriture HEIC est impossible.
+# AVIF est géré nativement par Pillow 12 si dispo, sinon via register_avif_opener.
+# HEIF_AVAILABLE est lu par _save_image_in_place (rotate/crop).
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
     HEIF_AVAILABLE = True
-except ImportError:
+except Exception:
     HEIF_AVAILABLE = False
+try:
+    from pillow_heif import register_avif_opener
+    register_avif_opener()
+except Exception:
+    pass  # AVIF couvert nativement par Pillow >= 12 si compilé avec libavif
+
+# RAW (libraw) — décodage des fichiers appareil photo (DNG/CR2/NEF/ARW…).
+try:
+    import rawpy as _rawpy
+    RAW_AVAILABLE = True
+except Exception:
+    RAW_AVAILABLE = False
+
+# exifread — lecture EXIF robuste, fallback pour RAW/TIFF quand getexif() échoue.
+try:
+    import exifread as _exifread
+    EXIFREAD_AVAILABLE = True
+except Exception:
+    EXIFREAD_AVAILABLE = False
+
+# Mémo des dates de capture, keyé (chemin_abs, mtime) → datetime | None.
+# Évite de relire EXIF/ffprobe à chaque /api/state. Plus robuste que le cache
+# pHash (qui est keyé rel-BASE et incohérent en multi-source).
+_capture_date_memo: dict = {}
 
 try:
     import appdirs
@@ -35,11 +70,13 @@ except ImportError:
 
 try:
     import numpy as np
-    import torch
     import open_clip as _open_clip
+    import torch
     CLIP_AVAILABLE = True
 except ImportError:
     CLIP_AVAILABLE = False
+
+from sort_memories import updater as _updater
 
 # ── Répertoires ──────────────────────────────────────────────────────────────
 # MEDIA_DIR  = dossier source à trier (sélectionné par l'utilisateur au lancement)
@@ -55,6 +92,7 @@ TRASH_DIR      = MEDIA_DIR / "_a_supprimer"
 # Namespace les fichiers d'état par dossier source (hash court du chemin absolu),
 # pour permettre à un même STATE_DIR de servir plusieurs MEDIA_DIR sans collision.
 import hashlib as _hashlib
+
 _MEDIA_NS      = _hashlib.sha1(str(MEDIA_DIR).encode()).hexdigest()[:12]
 _NS_DIR        = STATE_DIR / "folders" / _MEDIA_NS
 _NS_DIR.mkdir(parents=True, exist_ok=True)
@@ -64,14 +102,9 @@ STATE_FILE     = _NS_DIR / "triage_state.json"
 CACHE_FILE     = _NS_DIR / "dedupe_cache.json"
 GROUPS_FILE    = _NS_DIR / "dedupe_groups.json"
 
-# Formats supportés. IMAGE_EXT inclut HEIC/HEIF (iPhone), TIFF, BMP en plus des
-# formats web. VIDEO_EXT inclut M4V (iTunes), WebM, MKV, AVI. MEDIA_EXT dérivé.
-IMAGE_EXT      = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".tiff", ".tif", ".bmp"}
-VIDEO_EXT      = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
-MEDIA_EXT      = IMAGE_EXT | VIDEO_EXT
-
 # Formats pour lesquels Pillow peut écrire en gardant l'extension d'origine.
 # Les autres (.heic/.heif via pillow-heif) sont gérés à part dans _do_rotate/_do_crop.
+# (IMAGE_EXT/VIDEO_EXT/MEDIA_EXT sont définis plus bas, après SESSION_FILE — superset v0.6.0.)
 PIL_NATIVE_WRITE = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".tif", ".bmp"}
 
 HASH_THRESHOLD = 10   # distance Hamming ≤ 10/64 bits (~15%) — couvre ré-encodage, resize, changement format
@@ -87,12 +120,37 @@ app = Flask(__name__)
 
 SESSION_FILE = STATE_DIR / "session.json"
 
+# Formats RAW appareil photo (décodés via rawpy/libraw, jamais rendus par le navigateur).
+RAW_EXT = {".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2", ".srw", ".pef", ".raw"}
+
+# Toutes les photos prises en charge (triage + dédup + compression).
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif",
+             ".avif", ".tiff", ".tif", ".bmp"} | RAW_EXT
+
+# Tous les conteneurs vidéo décodables par ffmpeg.
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".flv", ".3gp",
+             ".3g2", ".mpg", ".mpeg", ".webm", ".ts", ".mts", ".m2ts", ".hevc"}
+
+MEDIA_EXT = IMAGE_EXT | VIDEO_EXT
+
+# Sous-ensembles rendus nativement par WKWebView (sinon → preview JPEG généré, cf. /preview).
+WEB_IMG_EXT   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif"}
+WEB_VIDEO_EXT = {".mp4", ".mov", ".m4v"}
+
+def _is_web_renderable(rel: str) -> bool:
+    """True si WKWebView peut afficher le fichier directement (sinon preview JPEG)."""
+    return Path(rel).suffix.lower() in (WEB_IMG_EXT | WEB_VIDEO_EXT)
+
 DEFAULT_OPTIONS = {
     "by_year":     True,
     "by_month":    False,
     "split_media": False,
     "rename":      False,
+    "order":       "default",   # "default" | "largest" — ordre de la file de triage
 }
+
+# Options non-booléennes (validées séparément dans api_config_set).
+_ORDER_VALUES = {"default", "largest"}
 
 # Pywebview window injectée par app.py via set_main_window() pour exposer le
 # folder picker natif à l'UI Flask via /api/pick_folder. None en dev browser.
@@ -190,7 +248,6 @@ def compute_keep_destination(entry: str) -> Path:
     src    = _entry_source(entry)
     rel    = _entry_rel(entry)
     opts   = _opts()
-    abs_p  = src / rel
     parts  = [src, "Tri", "Gardées"]
 
     if opts.get("split_media"):
@@ -201,35 +258,23 @@ def compute_keep_destination(entry: str) -> Path:
         else:
             parts.append("autres")
 
+    # Date de capture RÉELLE (EXIF/creation_time/nom/mtime), pas la date de fichier.
+    capture_dt = _capture_datetime(entry)
+
     if opts.get("by_year") or opts.get("by_month"):
-        import datetime
-        try:
-            mtime = abs_p.stat().st_mtime
-            dt    = datetime.datetime.fromtimestamp(mtime)
-            year  = str(dt.year)
-            month = f"{dt.month:02d}"
-            import re
-            m = re.match(r"^(\d{4})[-_](\d{2})", Path(rel).name)
-            if m:
-                year, month = m.group(1), m.group(2)
+        if capture_dt:
             if opts.get("by_year"):
-                parts.append(year)
+                parts.append(str(capture_dt.year))
             if opts.get("by_month"):
-                parts.append(month)
-        except Exception:
-            pass
+                parts.append(f"{capture_dt.month:02d}")
 
     if opts.get("rename"):
-        import datetime, re
-        try:
-            mtime = abs_p.stat().st_mtime
-            dt    = datetime.datetime.fromtimestamp(mtime)
-            stamp = dt.strftime("%Y-%m-%d")
-        except Exception:
-            stamp = "undated"
-        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", Path(rel).name)
-        if m:
-            stamp = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        if capture_dt:
+            stamp = capture_dt.strftime("%Y-%m-%d")
+        else:
+            import re
+            m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", Path(rel).name)
+            stamp = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else "undated"
         short_hash = _hashlib.sha1(rel.encode()).hexdigest()[:8]
         name = f"{stamp}_{short_hash}{Path(rel).suffix.lower()}"
     else:
@@ -324,7 +369,8 @@ def check_license() -> bool:
 
 def activate_license(key: str) -> dict:
     global _license_cache
-    import datetime, re
+    import datetime
+    import re
     key = key.strip()
     if not re.match(r'^[A-Z0-9\-]{10,}$', key, re.I):
         return {"ok": False, "error": "Clé invalide — format incorrect"}
@@ -492,6 +538,9 @@ def _init_mem():
             if _mem_state["current"] > len(_mem_state["files"]):
                 _mem_state["current"] = len(_mem_state["files"])
             _write_state_file()
+    # Tri de la file selon l'option (ex : traiter d'abord les plus volumineux)
+    if _apply_queue_order(_mem_state["files"]):
+        _write_state_file()
     # Groupes sémantiques CLIP
     if CLIP_GROUPS_PATH.exists():
         try:
@@ -500,6 +549,23 @@ def _init_mem():
             _mem_clip_file2group = cg.get("file_to_group", {})
         except Exception:
             pass
+
+def _entry_size(entry: str) -> int:
+    try:
+        return _entry_path(entry).stat().st_size
+    except Exception:
+        return 0
+
+def _apply_queue_order(files: list) -> bool:
+    """Réordonne la file de triage en place selon l'option `order`.
+    Retourne True si l'ordre a changé. `largest` = plus volumineux d'abord."""
+    if _opts().get("order") != "largest":
+        return False
+    ordered = sorted(files, key=_entry_size, reverse=True)
+    if ordered != files:
+        files[:] = ordered
+        return True
+    return False
 
 def _write_state_file():
     STATE_FILE.write_text(json.dumps(_mem_state, indent=2, ensure_ascii=False))
@@ -540,9 +606,18 @@ class UnionFind:
 
 def compute_image_hash(p: Path):
     try:
-        img = Image.open(p)
-        res = list(img.size)
-        h   = str(imagehash.phash(img))
+        ext = p.suffix.lower()
+        if ext in RAW_EXT:
+            if not RAW_AVAILABLE:
+                return None, None
+            with _rawpy.imread(str(p)) as raw:
+                rgb = raw.postprocess(use_camera_wb=True, half_size=True)
+            img = Image.fromarray(rgb)
+            res = [img.width * 2, img.height * 2]  # half_size → résolution réelle ×2
+        else:
+            img = Image.open(p)   # HEIC/AVIF/TIFF/BMP via openers enregistrés
+            res = list(img.size)
+        h = str(imagehash.phash(img))
         return h, res
     except Exception:
         return None, None
@@ -972,24 +1047,102 @@ def scan_clip():
 # EXISTING HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _year_label(entry: str) -> str:
-    """Heuristique année pour l'affichage uniquement.
+def _exif_datetime(p: Path):
+    """Date de prise de vue depuis l'EXIF d'une image. None si absente/illisible.
 
-    Ordre : (1) regex YYYY en début de filename (Snapchat convention),
-    (2) année du mtime du fichier, (3) "—".
+    Priorité tags : DateTimeOriginal (36867) > DateTimeDigitized (36868) > DateTime (306).
+    Couvre JPEG/TIFF/PNG/HEIC (via pillow_heif). Fallback exifread pour RAW/TIFF.
     """
-    import re
-    rel  = _entry_rel(entry)
-    name = Path(rel).name
-    m = re.match(r"^(\d{4})[-_]", name)
-    if m:
-        return m.group(1)
+    # 1) Pillow getexif (rapide, couvre la majorité)
     try:
-        import datetime
-        mtime = _entry_path(entry).stat().st_mtime
-        return str(datetime.datetime.fromtimestamp(mtime).year)
+        exif = Image.open(p).getexif()
+        for tag in (36867, 36868, 306):
+            val = exif.get(tag)
+            if val:
+                try:
+                    return _datetime.datetime.strptime(str(val).strip(), "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    continue
     except Exception:
-        return "—"
+        pass
+    # 2) exifread (fallback RAW/TIFF où Pillow ne lit pas l'IFD)
+    if EXIFREAD_AVAILABLE:
+        try:
+            with open(p, "rb") as fh:
+                tags = _exifread.process_file(fh, details=False, stop_tag="DateTimeOriginal")
+            for key in ("EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"):
+                if key in tags:
+                    try:
+                        return _datetime.datetime.strptime(str(tags[key]).strip(), "%Y:%m:%d %H:%M:%S")
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
+    return None
+
+
+def _video_creation_datetime(p: Path):
+    """creation_time du conteneur vidéo via ffprobe. None si absent."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags=creation_time",
+             "-of", "default=nw=1:nk=1", str(p)],
+            capture_output=True, text=True, timeout=10)
+        raw = r.stdout.strip()
+        if not raw:
+            return None
+        # Formats typiques : 2019-08-01T13:45:02.000000Z
+        raw = raw.replace("Z", "+00:00")
+        try:
+            return _datetime.datetime.fromisoformat(raw)
+        except ValueError:
+            return _datetime.datetime.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
+def _capture_datetime(entry: str):
+    """Date de capture réelle d'un média. None si totalement indéterminable.
+
+    Ordre STRICT (priorité aux vraies métadonnées) :
+      1. EXIF (image)  2. creation_time (vidéo)
+      3. AAAA[-_]MM dans le nom (convention Snapchat)
+      4. mtime du fichier  5. None
+    Mémoïsé par (chemin, mtime) pour éviter les relectures EXIF/ffprobe.
+    """
+    p = _entry_path(entry)
+    try:
+        mtime = p.stat().st_mtime
+    except Exception:
+        mtime = None
+    memo_key = (str(p), mtime)
+    if memo_key in _capture_date_memo:
+        return _capture_date_memo[memo_key]
+
+    ext = p.suffix.lower()
+    dt = None
+    if ext in IMAGE_EXT:
+        dt = _exif_datetime(p)
+    elif ext in VIDEO_EXT:
+        dt = _video_creation_datetime(p)
+
+    if dt is None:
+        m = _re.match(r"^(\d{4})[-_](\d{2})?", Path(_entry_rel(entry)).name)
+        if m and 1900 <= int(m.group(1)) <= 2100:
+            month = int(m.group(2)) if m.group(2) and 1 <= int(m.group(2)) <= 12 else 1
+            dt = _datetime.datetime(int(m.group(1)), month, 1)
+
+    if dt is None and mtime is not None:
+        dt = _datetime.datetime.fromtimestamp(mtime)
+
+    _capture_date_memo[memo_key] = dt
+    return dt
+
+
+def _year_label(entry: str) -> str:
+    """Année d'affichage, fondée sur les vraies métadonnées (cf. _capture_datetime)."""
+    dt = _capture_datetime(entry)
+    return str(dt.year) if dt else "—"
 
 
 def collect_files():
@@ -1234,7 +1387,8 @@ def api_state():
                 return {
                     "rel":         r,
                     "url":         f"/media/{r}",
-                    "is_video":    Path(rel_only).suffix.lower() in {".mp4", ".mov"},
+                    "preview_url": None if _is_web_renderable(rel_only) else f"/preview/{r}",
+                    "is_video":    Path(rel_only).suffix.lower() in VIDEO_EXT,
                     "size_kb":     round(p.stat().st_size / 1024) if p.exists() else 0,
                     "resolution":  f"{res[0]}×{res[1]}" if res else "?",
                     "date":        _year_label(r),
@@ -1270,10 +1424,11 @@ def api_state():
                 return {
                     "rel":         r,
                     "url":         f"/media/{r}",
-                    "is_video":    Path(r).suffix.lower() in {".mp4", ".mov"},
+                    "preview_url": None if _is_web_renderable(_entry_rel(r)) else f"/preview/{r}",
+                    "is_video":    Path(r).suffix.lower() in VIDEO_EXT,
                     "size_kb":     round(p.stat().st_size / 1024) if p.exists() else 0,
                     "resolution":  f"{res[0]}×{res[1]}" if res else "?",
-                    "date":        r.split("/")[-1].split("_")[0] if "/" in r else "?",
+                    "date":        _year_label(r),
                     "overlay_url": f"/media/{ov}" if ov else None,
                     "overlay_rel": ov,
                 }
@@ -1305,7 +1460,8 @@ def api_state():
         "name":           Path(rel_only).name,
         "year":           _year_label(rel),
         "url":            f"/media/{rel}",
-        "is_video":       ext in {".mp4", ".mov"},
+        "preview_url":    None if _is_web_renderable(rel_only) else f"/preview/{rel}",
+        "is_video":       ext in VIDEO_EXT,
         "can_back":       len(s["history"]) > 0,
         "overlay_url":    f"/media/{overlay}" if overlay else None,
         "overlay_rel":    overlay,
@@ -1591,8 +1747,15 @@ def api_config_set():
     if not valid_sources:
         return jsonify({"ok": False, "error": "Aucun dossier source valide fourni."}), 400
 
+    # Booléens coercés en bool ; `order` validé comme string dans _ORDER_VALUES.
+    clean_opts = {}
+    for k, v in options.items():
+        if k == "order":
+            clean_opts["order"] = v if v in _ORDER_VALUES else "default"
+        elif k in DEFAULT_OPTIONS:
+            clean_opts[k] = bool(v)
     _session_config["sources"]    = valid_sources
-    _session_config["options"]    = {**DEFAULT_OPTIONS, **{k: bool(v) for k, v in options.items() if k in DEFAULT_OPTIONS}}
+    _session_config["options"]    = {**DEFAULT_OPTIONS, **clean_opts}
     _session_config["configured"] = True
     _save_session_config()
 
@@ -1866,10 +2029,35 @@ def _video_codec(p: Path) -> str:
     except Exception:
         return ""
 
+def _raw_exif_bytes(p: Path):
+    """Construit un bloc EXIF minimal (DateTimeOriginal) pour un RAW, à réinjecter
+    dans le WebP de sortie. Retourne bytes | None."""
+    dt = _exif_datetime(p)
+    if not dt:
+        return None
+    try:
+        exif = Image.Exif()
+        exif[36867] = dt.strftime("%Y:%m:%d %H:%M:%S")  # DateTimeOriginal
+        exif[306]   = dt.strftime("%Y:%m:%d %H:%M:%S")   # DateTime
+        return exif.tobytes()
+    except Exception:
+        return None
+
+
 def _convert_one(p: Path, preset: dict):
-    """Convertit un fichier. Retourne (size_before, size_after, status, err)."""
+    """Convertit un fichier en préservant ses métadonnées. Retourne (before, after, status, err)."""
     ext = p.suffix.lower()
-    size_before = p.stat().st_size
+    st  = p.stat()
+    size_before = st.st_size
+    orig_times  = (st.st_atime, st.st_mtime)
+
+    def _preserve_times(target: Path):
+        # Filet de sécurité : le mtime d'origine reste la date affichée même si une
+        # métadonnée interne manquait. C'est la garantie anti « tout en 2026 ».
+        try:
+            os.utime(target, orig_times)
+        except Exception:
+            pass
 
     if size_before < MIN_CONVERT_SIZE:
         return size_before, size_before, "skipped", "trop petit"
@@ -1878,25 +2066,44 @@ def _convert_one(p: Path, preset: dict):
         if ext == ".webp":
             return size_before, size_before, "skipped", "déjà WebP"
         try:
-            img = Image.open(p)
-            if img.mode in ("RGBA", "P", "LA"):
-                bg = Image.new("RGB", img.size, (0, 0, 0))
-                if img.mode == "P":
-                    img = img.convert("RGBA")
-                if img.mode in ("RGBA", "LA"):
-                    bg.paste(img, mask=img.split()[-1])
-                    img = bg
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
+            if ext in RAW_EXT:
+                if not RAW_AVAILABLE:
+                    return size_before, size_before, "skipped", "rawpy indisponible"
+                with _rawpy.imread(str(p)) as raw:
+                    rgb = raw.postprocess(use_camera_wb=True)
+                img = Image.fromarray(rgb)
+                exif = _raw_exif_bytes(p)
+                icc = xmp = None
+            else:
+                img  = Image.open(p)
+                # Métadonnées à transporter vers le WebP AVANT toute conversion de mode.
+                exif = img.info.get("exif")
+                icc  = img.info.get("icc_profile")
+                xmp  = img.info.get("xmp")
+                if img.mode in ("RGBA", "P", "LA"):
+                    bg = Image.new("RGB", img.size, (0, 0, 0))
+                    if img.mode == "P":
+                        img = img.convert("RGBA")
+                    if img.mode in ("RGBA", "LA"):
+                        bg.paste(img, mask=img.split()[-1])
+                        img = bg
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+
             target = p.with_suffix(".webp")
             tmp = target.with_name("_conv_" + target.name)
-            img.save(tmp, "WEBP", quality=preset["webp_quality"], method=6)
+            save_kwargs = {"quality": preset["webp_quality"], "method": 6}
+            for k, v in {"exif": exif, "icc_profile": icc, "xmp": xmp}.items():
+                if v:
+                    save_kwargs[k] = v
+            img.save(tmp, "WEBP", **save_kwargs)
             size_after = tmp.stat().st_size
             if size_after >= size_before * 0.95:
                 tmp.unlink(missing_ok=True)
                 return size_before, size_before, "skipped", "pas de gain (≤5%)"
             p.unlink()
             tmp.rename(target)
+            _preserve_times(target)
             return size_before, size_after, "converted", None
         except Exception as e:
             return size_before, size_before, "error", str(e)[:200]
@@ -1913,6 +2120,8 @@ def _convert_one(p: Path, preset: dict):
                 "-preset", preset["x265_preset"],
                 "-c:a", "aac", "-b:a", "128k",
                 "-tag:v", "hvc1",
+                "-map_metadata", "0",          # copie creation_time + tags conteneur
+                "-movflags", "use_metadata_tags",
                 str(tmp),
             ], capture_output=True, timeout=1800)
             if r.returncode != 0:
@@ -1925,6 +2134,7 @@ def _convert_one(p: Path, preset: dict):
             new_path = p.with_suffix(".mp4")
             p.unlink()
             tmp.rename(new_path)
+            _preserve_times(new_path)
             return size_before, size_after, "converted", None
         except subprocess.TimeoutExpired:
             tmp.unlink(missing_ok=True)
@@ -2077,6 +2287,99 @@ def serve_media(entry):
     """
     return send_file(str(_entry_path(entry)))
 
+
+_PREVIEW_DIR = _NS_DIR / "previews"
+_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _build_preview(p: Path, out: Path) -> bool:
+    """Génère un JPEG d'aperçu (max 1280px) pour un format non rendu par le navigateur.
+    Images RAW/TIFF via rawpy/PIL, vidéos non-MP4 via poster frame ffmpeg. True si OK."""
+    ext = p.suffix.lower()
+    try:
+        if ext in IMAGE_EXT:
+            if ext in RAW_EXT:
+                if not RAW_AVAILABLE:
+                    return False
+                with _rawpy.imread(str(p)) as raw:
+                    rgb = raw.postprocess(use_camera_wb=True, half_size=True)
+                img = Image.fromarray(rgb)
+            else:
+                img = Image.open(p)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+            img.thumbnail((1280, 1280))
+            img.save(out, "JPEG", quality=85)
+            return out.exists()
+        if ext in VIDEO_EXT:
+            r = subprocess.run([
+                "ffmpeg", "-y", "-ss", "1", "-i", str(p),
+                "-frames:v", "1", "-vf", "scale='min(1280,iw)':-2",
+                "-q:v", "4", str(out),
+            ], capture_output=True, timeout=30)
+            return r.returncode == 0 and out.exists()
+    except Exception:
+        return False
+    return False
+
+
+@app.route("/preview/<path:entry>")
+def serve_preview(entry):
+    """JPEG d'aperçu pour les formats non affichables nativement (RAW, AVI/MKV…).
+    Mis en cache dans previews/, invalidé sur changement de mtime."""
+    p = _entry_path(entry)
+    if not p.exists():
+        return jsonify({"error": "not found"}), 404
+    try:
+        sig = f"{p}:{p.stat().st_mtime_ns}"
+    except Exception:
+        sig = str(p)
+    key = _hashlib.sha1(sig.encode()).hexdigest()[:16]
+    out = _PREVIEW_DIR / f"{key}.jpg"
+    if not out.exists():
+        if not _build_preview(p, out):
+            return jsonify({"error": "preview failed"}), 415
+    return send_file(str(out), mimetype="image/jpeg")
+
+
+@app.route("/api/gallery")
+def api_gallery():
+    """Galerie de tous les médias, triable. ?sort=size_desc|size_asc|date_desc|date_asc|name."""
+    if not _is_configured():
+        return jsonify({"ok": False, "error": "session non configurée"}), 400
+    sort = request.args.get("sort", "size_desc")
+    items = []
+    for entry in collect_files():
+        rel_only = _entry_rel(entry)
+        try:
+            sz = _entry_path(entry).stat().st_size
+        except Exception:
+            sz = 0
+        dt = _capture_datetime(entry)
+        items.append({
+            "rel":         entry,
+            "url":         f"/media/{entry}",
+            "preview_url": None if _is_web_renderable(rel_only) else f"/preview/{entry}",
+            "is_video":    Path(rel_only).suffix.lower() in VIDEO_EXT,
+            "size_kb":     round(sz / 1024),
+            "size_bytes":  sz,
+            "year":        str(dt.year) if dt else "—",
+            "ts":          dt.timestamp() if dt else 0,
+            "name":        Path(rel_only).name,
+        })
+    keyfns = {
+        "size_desc": (lambda it: it["size_bytes"], True),
+        "size_asc":  (lambda it: it["size_bytes"], False),
+        "date_desc": (lambda it: it["ts"], True),
+        "date_asc":  (lambda it: it["ts"], False),
+        "name":      (lambda it: it["name"].lower(), False),
+    }
+    keyfn, rev = keyfns.get(sort, keyfns["size_desc"])
+    items.sort(key=keyfn, reverse=rev)
+    total_bytes = sum(it["size_bytes"] for it in items)
+    return jsonify({"ok": True, "sort": sort, "count": len(items),
+                    "total_mb": round(total_bytes / (1024 * 1024), 1), "items": items})
+
 @app.route("/api/reorganize", methods=["POST"])
 def api_reorganize():
     """Deprecated en v0.2.0 : les actions keep/trash déplacent immédiatement.
@@ -2085,6 +2388,122 @@ def api_reorganize():
     """
     return jsonify({"ok": False, "deprecated": True,
                     "message": "Les actions sont appliquées immédiatement depuis v0.2.0."}), 410
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTO-UPDATE (v0.5.0+)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_update_lock = threading.Lock()
+_update_state = {
+    "checked":     False,        # True dès qu'un check (réussi ou non) a été fait
+    "checking":    False,        # True pendant le fetch GitHub API
+    "ok":          False,        # True si le dernier check a abouti
+    "current":     "",           # version courante
+    "latest":      None,         # tag de la dernière release
+    "available":   False,        # update dispo ?
+    "url":         None,         # URL du zip
+    "size":        None,         # bytes
+    "notes":       "",           # release notes
+    "error":       None,         # message d'erreur si check a échoué
+    "downloading": False,        # download en cours
+    "dl_done":     0,            # bytes téléchargés
+    "dl_total":    0,            # total bytes
+    "installing":  False,        # extract + relauncher en cours
+    "install_err": None,         # erreur d'install
+}
+
+def _do_check_update():
+    """Worker : appelle l'API GitHub et met à jour _update_state."""
+    with _update_lock:
+        _update_state["checking"] = True
+        _update_state["error"]    = None
+    try:
+        result = _updater.check_latest()
+    except Exception as e:
+        with _update_lock:
+            _update_state["checking"] = False
+            _update_state["checked"]  = True
+            _update_state["ok"]       = False
+            _update_state["error"]    = f"Exception: {str(e)[:120]}"
+        return
+    with _update_lock:
+        _update_state.update({
+            "checking":  False,
+            "checked":   True,
+            "ok":        result["ok"],
+            "current":   result["current"],
+            "latest":    result["latest"],
+            "available": result["available"],
+            "url":       result["url"],
+            "size":      result["size"],
+            "notes":     result["notes"],
+            "error":     result["error"],
+        })
+
+def _kickoff_startup_check():
+    """À appeler depuis app.py au démarrage : check silencieux en thread daemon."""
+    t = threading.Thread(target=_do_check_update, daemon=True, name="update-check")
+    t.start()
+
+def _do_install_update():
+    """Worker : download + extract + relauncher + sys.exit. NE REVIENT JAMAIS."""
+    with _update_lock:
+        url = _update_state["url"]
+    if not url:
+        with _update_lock:
+            _update_state["installing"]  = False
+            _update_state["install_err"] = "URL de téléchargement manquante (relancez la vérification)."
+        return
+
+    def progress(done, total):
+        with _update_lock:
+            _update_state["dl_done"]  = done
+            _update_state["dl_total"] = total
+
+    try:
+        with _update_lock:
+            _update_state["downloading"] = True
+            _update_state["installing"]  = True
+            _update_state["install_err"] = None
+        zip_path = Path(tempfile.gettempdir()) / "sort-memories-update.zip"
+        _updater.download_release(url, zip_path, progress_cb=progress)
+        with _update_lock:
+            _update_state["downloading"] = False
+        # install_release ne revient pas (os._exit)
+        _updater.install_release(zip_path)
+    except Exception as e:
+        with _update_lock:
+            _update_state["downloading"] = False
+            _update_state["installing"]  = False
+            _update_state["install_err"] = str(e)[:200]
+
+@app.route("/api/update/check", methods=["POST"])
+def api_update_check():
+    """Déclenche un check (async). L'UI poll /api/update/status."""
+    with _update_lock:
+        if _update_state["checking"] or _update_state["installing"]:
+            return jsonify({"ok": False, "busy": True}), 409
+    t = threading.Thread(target=_do_check_update, daemon=True, name="update-check-manual")
+    t.start()
+    return jsonify({"ok": True, "triggered": True})
+
+@app.route("/api/update/status", methods=["GET"])
+def api_update_status():
+    """État courant de l'updater (check + download + install). Poll-friendly."""
+    with _update_lock:
+        return jsonify(dict(_update_state))
+
+@app.route("/api/update/install", methods=["POST"])
+def api_update_install():
+    """Déclenche le download + install + relauncher. L'app va quitter."""
+    with _update_lock:
+        if not _update_state.get("available") or not _update_state.get("url"):
+            return jsonify({"ok": False, "error": "Aucune mise à jour disponible."}), 400
+        if _update_state["installing"] or _update_state["downloading"]:
+            return jsonify({"ok": False, "busy": True}), 409
+    t = threading.Thread(target=_do_install_update, daemon=True, name="update-install")
+    t.start()
+    return jsonify({"ok": True, "triggered": True})
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PAGE HTML
@@ -2435,6 +2854,31 @@ PAGE = r"""<!DOCTYPE html>
   .wc-convert-info button:hover { background: rgba(251,146,60,.25); }
   .wc-convert-info button:disabled { background: #1a1a1a; color: #555; border-color: #2a2a2a; cursor: not-allowed; }
 
+  /* Mises à jour (welcome view) */
+  .wc-update-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: #ccc; }
+  .wc-update-current b { color: #ddd; font-weight: 600; }
+  .wc-update-btn {
+    background: #1a1a1a; border: 1px solid #333; color: #ccc;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  .wc-update-btn:hover { border-color: #555; background: #222; }
+  .wc-update-btn:disabled { color: #555; cursor: not-allowed; }
+  .wc-update-banner {
+    margin-top: 12px; padding: 12px 14px; border-radius: 8px;
+    background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35);
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .wc-update-banner-text { display: flex; align-items: center; gap: 12px; }
+  .wc-update-emoji { font-size: 22px; }
+  .wc-update-banner-text b { color: #e9e2ff; font-size: 13px; }
+  .wc-update-btn-primary {
+    background: rgba(167,139,250,.18); border: 1px solid rgba(167,139,250,.5); color: #c4b5fd;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .wc-update-btn-primary:hover { background: rgba(167,139,250,.3); }
+  .wc-update-btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+
   #cvm-bar-wrap {
     background: #0a0a0a; border-radius: 4px; height: 8px; overflow: hidden; margin: 14px 0 10px;
   }
@@ -2618,6 +3062,7 @@ PAGE = r"""<!DOCTYPE html>
         <label><input type="checkbox" id="opt-by_month"> Aussi par mois</label>
         <label><input type="checkbox" id="opt-split_media"> Séparer images / vidéos</label>
         <label><input type="checkbox" id="opt-rename"> Renommer (YYYY-MM-DD_hash.ext)</label>
+        <label><input type="checkbox" id="opt-order_largest"> Traiter d'abord les fichiers les plus volumineux</label>
       </div>
     </section>
 
@@ -2628,7 +3073,7 @@ PAGE = r"""<!DOCTYPE html>
 
     <section class="wc-section">
       <label>Compression avant tri (optionnel)</label>
-      <p class="wc-hint">Convertit JPG/PNG en WebP et MP4/MOV en H.265. Gain disque + tri plus fluide. <b style="color:#fb923c">Irréversible</b> — les originaux sont remplacés.</p>
+      <p class="wc-hint">Convertit toutes les photos (JPG/PNG/HEIC/TIFF/RAW…) en WebP et toutes les vidéos (MP4/MOV/AVI/MKV…) en H.265, en <b style="color:#4ade80">préservant les métadonnées</b> (date de prise de vue, GPS). Gain disque + tri plus fluide. <b style="color:#fb923c">Irréversible</b> — les originaux sont remplacés.</p>
       <div class="wc-presets">
         <label class="wc-preset"><input type="radio" name="wc-preset" value="none" checked> <span class="wc-pres-name">Aucune</span><span class="wc-pres-desc">Tri direct sur les originaux</span></label>
         <label class="wc-preset"><input type="radio" name="wc-preset" value="lossless"> <span class="wc-pres-name">Sans perte</span><span class="wc-pres-desc">WebP q90 + H.265 CRF 22 — gain ~30-50%, imperceptible</span></label>
@@ -2638,8 +3083,67 @@ PAGE = r"""<!DOCTYPE html>
       <div id="wc-convert-info" class="wc-convert-info"></div>
     </section>
 
+    <section class="wc-section">
+      <label>Mises à jour</label>
+      <div class="wc-update-row">
+        <span class="wc-update-current">Version installée : <b id="wc-current-version">v?.?.?</b></span>
+        <button id="wc-check-update" class="wc-update-btn" onclick="checkForUpdate(true)">Vérifier maintenant</button>
+      </div>
+      <div id="wc-update-banner" class="wc-update-banner" style="display:none">
+        <div class="wc-update-banner-text">
+          <span class="wc-update-emoji">🎉</span>
+          <div>
+            <b>Nouvelle version disponible : <span id="wc-update-latest">vX.Y.Z</span></b>
+            <p class="wc-hint" id="wc-update-size"></p>
+          </div>
+        </div>
+        <button id="wc-install-update" class="wc-update-btn-primary" onclick="installUpdate()">Mettre à jour →</button>
+      </div>
+      <p id="wc-update-msg" class="wc-hint"></p>
+    </section>
+
     <button id="wc-start" onclick="wcStart()" disabled>Démarrer le triage →</button>
+    <button id="wc-gallery-btn" onclick="openGallery()" disabled style="margin-top:8px;background:#1f1f1f;color:#ddd">📊 Galerie — voir les plus volumineux</button>
     <p id="wc-error" class="wc-err"></p>
+  </div>
+</div>
+
+<!-- Modal galerie triable -->
+<div class="modal-back" id="gallery-modal">
+  <div class="modal-card" style="max-width:1100px;width:94vw;height:88vh;display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0">
+      <h3 style="margin:0">Galerie <span id="gal-count" style="color:#777;font-weight:400;font-size:13px"></span></h3>
+      <div style="display:flex;align-items:center;gap:10px">
+        <select id="gal-sort" onchange="loadGallery(this.value)" style="background:#1a1a1a;color:#ddd;border:1px solid #333;border-radius:6px;padding:6px 10px;font-size:13px">
+          <option value="size_desc">Plus volumineux d'abord</option>
+          <option value="size_asc">Plus légers d'abord</option>
+          <option value="date_desc">Plus récents d'abord</option>
+          <option value="date_asc">Plus anciens d'abord</option>
+          <option value="name">Nom (A→Z)</option>
+        </select>
+        <button class="modal-btn-cancel" onclick="closeGallery()" style="padding:6px 14px">Fermer</button>
+      </div>
+    </div>
+    <div id="gal-grid" style="flex:1;overflow-y:auto;margin-top:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;align-content:start"></div>
+  </div>
+</div>
+
+<!-- Modal téléchargement mise à jour -->
+<div class="modal-back" id="update-modal">
+  <div class="modal-card" style="max-width:480px">
+    <h3 id="um-title">Téléchargement en cours…</h3>
+    <p class="wc-hint" id="um-detail">Sort Memories va se relancer automatiquement dès que l'installation est terminée.</p>
+    <div id="cvm-bar-wrap" style="margin-top:16px">
+      <div id="um-bar" style="height:100%;width:0%;background:#a78bfa;border-radius:6px;transition:width .2s"></div>
+    </div>
+    <div id="cvm-stats" style="margin-top:8px">
+      <span><b id="um-pct">0%</b></span>
+      <span id="um-bytes">0 / 0 MB</span>
+    </div>
+    <p id="um-error" style="color:#f87171;font-size:12px;margin-top:12px;display:none"></p>
+    <div class="modal-actions">
+      <button id="um-cancel" class="modal-btn-cancel" onclick="closeUpdateModal()" style="display:none">Fermer</button>
+    </div>
   </div>
 </div>
 
@@ -3075,7 +3579,9 @@ function renderSingle() {
   wrap.style.display = 'inline-flex';
 
   const ts = '?t=' + Date.now();
-  if (current.is_video) {
+  // Vidéo lisible nativement uniquement si pas de preview_url (mp4/mov/m4v).
+  // Sinon (AVI/MKV/RAW…) on affiche l'aperçu JPEG généré côté serveur.
+  if (current.is_video && !current.preview_url) {
     const v    = document.createElement('video');
     v.id       = 'main-video';
     v.src      = current.url + ts;
@@ -3092,7 +3598,7 @@ function renderSingle() {
     document.getElementById('vc-mute').textContent      = '🔊';
   } else {
     const img = document.createElement('img');
-    img.id    = 'main-img'; img.src = current.url + ts;
+    img.id    = 'main-img'; img.src = (current.preview_url || current.url) + ts;
     wrap.insertBefore(img, wrap.firstChild);
   }
 
@@ -3145,7 +3651,7 @@ function renderGroup() {
     const mwrap = document.createElement('div');
     mwrap.className = 'g-media-wrap';
 
-    if (f.is_video) {
+    if (f.is_video && !f.preview_url) {
       const v      = document.createElement('video');
       v.className  = 'g-video';
       v.src        = f.url + ts;
@@ -3155,7 +3661,7 @@ function renderGroup() {
     } else {
       const img    = document.createElement('img');
       img.className = 'g-img';
-      img.src       = f.url + ts;
+      img.src       = (f.preview_url || f.url) + ts;
       mwrap.appendChild(img);
       if (f.overlay_url) {
         const ov     = document.createElement('img');
@@ -3229,7 +3735,7 @@ function renderSemantic() {
 
     const mwrap = document.createElement('div');
     mwrap.className = 'g-media-wrap';
-    if (f.is_video) {
+    if (f.is_video && !f.preview_url) {
       const v     = document.createElement('video');
       v.className = 'g-video';
       v.src       = f.url + ts;
@@ -3239,7 +3745,7 @@ function renderSemantic() {
     } else {
       const img     = document.createElement('img');
       img.className = 'g-img';
-      img.src       = f.url + ts;
+      img.src       = (f.preview_url || f.url) + ts;
       mwrap.appendChild(img);
     }
     cell.appendChild(mwrap);
@@ -3454,7 +3960,7 @@ async function activateLicense() {
 }
 
 /* ─── Welcome view (v0.2.0) ─────────────────────────────── */
-let wcState = { sources: [], options: { by_year: true, by_month: false, split_media: false, rename: false } };
+let wcState = { sources: [], options: { by_year: true, by_month: false, split_media: false, rename: false, order: 'default' } };
 
 function wcUpdatePreview() {
   const parts = ['<source>', 'Tri', 'Gardées'];
@@ -3483,7 +3989,48 @@ function wcRenderSources() {
     ul.appendChild(li);
   });
   document.getElementById('wc-start').disabled = wcState.sources.length === 0;
+  const galBtn = document.getElementById('wc-gallery-btn');
+  if (galBtn) galBtn.disabled = wcState.sources.length === 0;
   wcUpdateConvertInfo();
+}
+
+/* ─── Galerie triable (lecture seule) ─────────────────────── */
+async function openGallery() {
+  document.getElementById('gallery-modal').classList.add('show');
+  await loadGallery(document.getElementById('gal-sort').value);
+}
+function closeGallery() {
+  document.getElementById('gallery-modal').classList.remove('show');
+}
+async function loadGallery(sort) {
+  const grid = document.getElementById('gal-grid');
+  grid.innerHTML = '<p style="color:#777;grid-column:1/-1;padding:20px">Chargement…</p>';
+  try {
+    const r = await fetch('/api/gallery?sort=' + encodeURIComponent(sort));
+    const d = await r.json();
+    if (!d.ok) { grid.innerHTML = '<p style="color:#e66;grid-column:1/-1;padding:20px">' + (d.error || 'Erreur') + '</p>'; return; }
+    document.getElementById('gal-count').textContent =
+      `· ${d.count} fichier(s) · ${d.total_mb} Mo`;
+    grid.innerHTML = '';
+    d.items.forEach(it => {
+      const cell = document.createElement('div');
+      cell.style.cssText = 'background:#141414;border:1px solid #262626;border-radius:8px;overflow:hidden;display:flex;flex-direction:column';
+      const thumb = (it.preview_url || it.url);
+      const sizeStr = it.size_kb >= 1024 ? (it.size_kb / 1024).toFixed(1) + ' Mo' : it.size_kb + ' Ko';
+      cell.innerHTML =
+        `<div style="aspect-ratio:1;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden">
+           <img loading="lazy" src="${thumb}" style="width:100%;height:100%;object-fit:cover">
+         </div>
+         <div style="padding:6px 8px;font-size:11px;color:#bbb;display:flex;justify-content:space-between;gap:6px">
+           <span style="font-weight:600;color:#fb923c">${sizeStr}</span><span>${it.year}</span>
+         </div>
+         <div style="padding:0 8px 6px;font-size:10px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${it.name}">${it.is_video ? '🎬 ' : ''}${it.name}</div>`;
+      grid.appendChild(cell);
+    });
+    if (!d.items.length) grid.innerHTML = '<p style="color:#777;grid-column:1/-1;padding:20px">Aucun média.</p>';
+  } catch (e) {
+    grid.innerHTML = '<p style="color:#e66;grid-column:1/-1;padding:20px">Erreur réseau.</p>';
+  }
 }
 
 function wcRemoveSource(i) {
@@ -3496,6 +4043,7 @@ function wcSyncOptions() {
   wcState.options.by_month    = document.getElementById('opt-by_month').checked;
   wcState.options.split_media = document.getElementById('opt-split_media').checked;
   wcState.options.rename      = document.getElementById('opt-rename').checked;
+  wcState.options.order       = document.getElementById('opt-order_largest').checked ? 'largest' : 'default';
   wcUpdatePreview();
 }
 
@@ -3701,6 +4249,12 @@ function wcShow() {
       el._bound    = true;
     }
   });
+  const elOrder = document.getElementById('opt-order_largest');
+  if (elOrder && !elOrder._bound) {
+    elOrder.checked = wcState.options.order === 'largest';
+    elOrder.onchange = wcSyncOptions;
+    elOrder._bound  = true;
+  }
   wcRenderSources();
   wcUpdatePreview();
 }
@@ -4069,8 +4623,167 @@ document.addEventListener('keydown', (e) => {
   }, 800);
 })();
 
+/* ─── Auto-update (v0.5.0+) ─────────────────────────────── */
+
+function fmtMB(bytes) {
+  if (!bytes) return '0 MB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function initUpdateUI() {
+  // Affiche la version courante sans attendre le check
+  try {
+    const r = await fetch('/api/update/status');
+    const s = await r.json();
+    const v = document.getElementById('wc-current-version');
+    if (v && s.current) v.textContent = 'v' + s.current;
+  } catch (e) { /* silent */ }
+
+  // Check silencieux au démarrage : 1s après load pour ne pas bloquer le boot
+  setTimeout(() => checkForUpdate(false), 1000);
+}
+
+async function checkForUpdate(verbose) {
+  const btn  = document.getElementById('wc-check-update');
+  const msg  = document.getElementById('wc-update-msg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Vérification…'; }
+  if (verbose && msg) msg.textContent = '';
+
+  try {
+    await fetch('/api/update/check', { method: 'POST' });
+  } catch (e) {
+    if (msg) msg.textContent = 'Connexion impossible.';
+    if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+    return;
+  }
+
+  // Poll status jusqu'à fin du check
+  let tries = 0;
+  const poll = async () => {
+    tries++;
+    let s;
+    try {
+      const r = await fetch('/api/update/status');
+      s = await r.json();
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+      return;
+    }
+    if (s.checking && tries < 30) {
+      setTimeout(poll, 500);
+      return;
+    }
+    renderUpdateState(s, verbose);
+  };
+  poll();
+}
+
+function renderUpdateState(s, verbose) {
+  const btn    = document.getElementById('wc-check-update');
+  const msg    = document.getElementById('wc-update-msg');
+  const banner = document.getElementById('wc-update-banner');
+  const latest = document.getElementById('wc-update-latest');
+  const size   = document.getElementById('wc-update-size');
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+
+  if (!s.ok) {
+    if (msg) msg.textContent = s.error || 'Vérification impossible.';
+    if (banner) banner.style.display = 'none';
+    return;
+  }
+
+  if (s.available) {
+    if (latest) latest.textContent = s.latest || '';
+    if (size)   size.textContent   = s.size ? `Taille : ${fmtMB(s.size)}` : '';
+    if (banner) banner.style.display = 'flex';
+    if (msg) msg.textContent = '';
+  } else {
+    if (banner) banner.style.display = 'none';
+    if (msg && verbose) msg.textContent = `Vous avez la dernière version (v${s.current}).`;
+  }
+}
+
+async function installUpdate() {
+  const installBtn = document.getElementById('wc-install-update');
+  if (installBtn) installBtn.disabled = true;
+
+  // Ouvre le modal
+  document.getElementById('update-modal').classList.add('on');
+  document.getElementById('um-error').style.display = 'none';
+  document.getElementById('um-cancel').style.display = 'none';
+  document.getElementById('um-bar').style.width = '0%';
+  document.getElementById('um-pct').textContent = '0%';
+  document.getElementById('um-bytes').textContent = '0 / 0 MB';
+  document.getElementById('um-title').textContent = 'Téléchargement en cours…';
+
+  try {
+    const r = await fetch('/api/update/install', { method: 'POST' });
+    const j = await r.json();
+    if (!j.ok) {
+      showUpdateError(j.error || 'Erreur de déclenchement');
+      return;
+    }
+  } catch (e) {
+    showUpdateError('Connexion impossible.');
+    return;
+  }
+
+  // Poll download progress
+  const poll = async () => {
+    let s;
+    try {
+      const r = await fetch('/api/update/status');
+      s = await r.json();
+    } catch (e) {
+      showUpdateError('Connexion perdue pendant le téléchargement.');
+      return;
+    }
+
+    if (s.install_err) {
+      showUpdateError(s.install_err);
+      return;
+    }
+
+    if (s.downloading || s.installing) {
+      const total = s.dl_total || 0;
+      const done  = s.dl_done  || 0;
+      const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
+      document.getElementById('um-bar').style.width = pct + '%';
+      document.getElementById('um-pct').textContent = pct + '%';
+      document.getElementById('um-bytes').textContent = fmtMB(done) + ' / ' + fmtMB(total);
+      if (!s.downloading && s.installing) {
+        document.getElementById('um-title').textContent = 'Installation en cours…';
+        document.getElementById('um-detail').textContent = 'Sort Memories va se relancer dans un instant.';
+      }
+      setTimeout(poll, 400);
+      return;
+    }
+
+    // Si on arrive ici sans erreur, c'est que l'install s'est faite (l'app va quitter)
+    // mais comme l'app peut prendre 1-2s avant os._exit, on continue à poll
+    setTimeout(poll, 500);
+  };
+  poll();
+}
+
+function showUpdateError(msg) {
+  document.getElementById('um-title').textContent = 'Échec de la mise à jour';
+  const err = document.getElementById('um-error');
+  err.textContent = msg;
+  err.style.display = '';
+  document.getElementById('um-cancel').style.display = '';
+  const installBtn = document.getElementById('wc-install-update');
+  if (installBtn) installBtn.disabled = false;
+}
+
+function closeUpdateModal() {
+  document.getElementById('update-modal').classList.remove('on');
+}
+
 load();
 updateTrashBadge();
+initUpdateUI();
 </script>
 </body>
 </html>"""
