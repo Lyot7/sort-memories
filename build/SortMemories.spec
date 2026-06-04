@@ -22,7 +22,7 @@ hiddenimports += collect_submodules("sort_memories")
 hiddenimports += collect_submodules("send2trash")
 hiddenimports += collect_submodules("pillow_heif")   # HEIC/HEIF/AVIF iPhone
 hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash",
-                  "pillow_heif", "rawpy", "exifread"]
+                  "pillow_heif", "rawpy", "exifread", "sort_memories.updater"]
 
 datas = []
 datas += collect_data_files("webview")

@@ -15,10 +15,10 @@ fi
 
 echo "Installing dependencies…"
 .venv/bin/pip install --quiet --upgrade pip
-.venv/bin/pip install --quiet flask pillow imagehash numpy pywebview appdirs send2trash pyinstaller
+.venv/bin/pip install --quiet flask pillow pillow-heif imagehash numpy pywebview appdirs send2trash pyinstaller
 
 echo "Cleaning previous build…"
-rm -rf dist build/work
+trash dist build/work 2>/dev/null || true
 
 echo "Running PyInstaller…"
 .venv/bin/pyinstaller build/SortMemories.spec \
