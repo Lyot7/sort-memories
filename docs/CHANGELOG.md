@@ -1,5 +1,37 @@
 # Changelog
 
+## [2026-06-04] v0.6.0 — tous formats + métadonnées préservées + tri par volume
+
+> S'appuie sur la v0.5.0 (HEIC iPhone + formats vidéo + auto-update). Cette version ajoute RAW/AVIF, la préservation des métadonnées, le fix de l'année, le preview et le tri par volume.
+
+**Type** : Feature
+**Story** : Compresser n'importe quel format sans jamais perdre la date de prise de vue ; trier par volume
+**Fichiers modifiés** : `sort_memories/core.py`, `pyproject.toml`, `build/SortMemories.spec`, `docs/`, `README.md`
+
+**Problème résolu (déclencheur)** : une vidéo de bébé compressée s'affichait en **2026**. Cause : la compression v0.4.0 détruisait les métadonnées (images sauvées sans EXIF, ffmpeg sans `-map_metadata`) et réécrivait le `mtime` à la date de compression ; l'affichage de l'année tombait alors sur ce mtime. ⚠️ Les fichiers déjà compressés en v0.4.0 ont probablement perdu leur date de façon irrécupérable (sauf `YYYY` dans le nom) — cette version empêche toute perte future.
+
+**Tous les formats (toute l'app : triage + dédup + compression)** :
+- Photos : ajout HEIC/HEIF (iPhone), AVIF, TIFF, BMP, et **RAW** (DNG/CR2/CR3/NEF/ARW/RAF/ORF/RW2/SRW/PEF) via `pillow-heif` + `rawpy`.
+- Vidéos : ajout M4V, AVI, MKV, WMV, FLV, 3GP, MPG/MPEG, WEBM, TS, MTS, M2TS (décodés par ffmpeg, sortie H.265 MP4).
+- Endpoint `GET /preview/<entry>` : JPEG d'aperçu à la volée (cache disque) pour les formats que WKWebView ne sait pas rendre (RAW, vidéos non-MP4). Le front bascule sur `preview_url` quand nécessaire.
+
+**Préservation des métadonnées à la compression** :
+- Images → WebP : transfert `exif` + `icc_profile` + `xmp`. RAW → WebP : EXIF reconstruit (DateTimeOriginal) via exifread.
+- Vidéos → H.265 : `-map_metadata 0` + `-movflags use_metadata_tags` (copie `creation_time` + tags conteneur).
+- **Filet de sécurité** : `os.utime` recopie le `mtime` d'origine sur le fichier compressé → l'année reste juste même si une métadonnée interne manquait.
+
+**Année fondée sur les vraies métadonnées** :
+- Nouveau `_capture_datetime` : EXIF DateTimeOriginal/Digitized/DateTime (image) → `creation_time` ffprobe (vidéo) → `AAAA[-_]MM` du nom → mtime → "—". Mémoïsé par (chemin, mtime).
+- `_year_label` réécrit par-dessus. `compute_keep_destination` range désormais par vraie date de capture (dossiers `Gardées/AAAA/MM/` + rename `AAAA-MM-JJ`).
+
+**Tri par volume** :
+- Option session `order: "largest"` (case « Traiter d'abord les fichiers les plus volumineux » dans l'accueil) → la file de triage présente les plus lourds en premier.
+- Nouvelle galerie (`GET /api/gallery?sort=size_desc|size_asc|date_desc|date_asc|name`) + bouton « 📊 Galerie » : grille de vignettes triable (lecture seule).
+
+**Vérification** : 20/20 tests sur fixtures (JPEG EXIF 2015, HEIC EXIF 2018, MOV creation_time 2019, AVI, fichier nommé 2017), tous avec mtime forcé à 2026 → année correcte affichée ; compression JPEG→WebP (424→116 Ko) et MOV→H.265 (488→56 Ko) conservent EXIF/creation_time + mtime ; preview AVI OK ; tri galerie + file OK.
+
+**Limites assumées** : RAW→WebP est lossy/irréversible (choix produit) ; les fichiers déjà compressés en v0.4.0 ne sont pas récupérables côté fichier.
+
 ## [2026-05-24] v0.4.0 — compression pré-triage (WebP + H.265)
 
 **Type** : Feature

@@ -3,7 +3,9 @@
 # Output : dist/Sort Memories.app
 
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_data_files, collect_submodules, collect_dynamic_libs,
+)
 
 block_cipher = None
 
@@ -18,10 +20,18 @@ hiddenimports += collect_submodules("flask")
 hiddenimports += collect_submodules("webview")
 hiddenimports += collect_submodules("sort_memories")
 hiddenimports += collect_submodules("send2trash")
-hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash"]
+hiddenimports += collect_submodules("pillow_heif")   # HEIC/HEIF/AVIF iPhone
+hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash",
+                  "pillow_heif", "rawpy", "exifread"]
 
 datas = []
 datas += collect_data_files("webview")
+
+# Bibliothèques natives : libheif (pillow_heif) + libraw (rawpy). Sans elles,
+# le décodage HEIC/RAW échoue dans le .app bundlé.
+binaries = []
+binaries += collect_dynamic_libs("pillow_heif")
+binaries += collect_dynamic_libs("rawpy")
 
 # torch + open_clip exclus du bundle v0.1.0 (CLIP optionnel, gain ~2 GB).
 # La détection runtime via try/except dans core.py désactive proprement la vue CLIP.
@@ -42,7 +52,7 @@ excludes = [
 a = Analysis(
     [_APP_ENTRY],
     pathex=[_PROJECT_ROOT],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -87,12 +97,12 @@ app = BUNDLE(
     name="Sort Memories.app",
     icon=None,
     bundle_identifier="fr.eliottbouquerel.sortmemories",
-    version="0.4.0",
+    version="0.6.0",
     info_plist={
         "CFBundleName": "Sort Memories",
         "CFBundleDisplayName": "Sort Memories",
-        "CFBundleVersion": "0.4.0",
-        "CFBundleShortVersionString": "0.4.0",
+        "CFBundleVersion": "0.6.0",
+        "CFBundleShortVersionString": "0.6.0",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
         "NSHumanReadableCopyright": "© 2026 Eliott Bouquerel. Tous droits réservés.",

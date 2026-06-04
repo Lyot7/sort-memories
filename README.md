@@ -20,10 +20,12 @@ Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi 
 - 🗑 **Vider la corbeille** : bouton qui envoie tous les `Tri/Supprimées/` à la Corbeille macOS (réversible)
 - ↶ **Undo** : `←` revient en arrière sans perdre l'état (keep et delete réversibles)
 - 🔍 **Déduplication pHash** : détecte les copies exactes ou re-encodées (resize, conversion JPG↔PNG, etc.)
-- 🎬 **Support vidéo** : MP4/MOV (rotation, trim, dedupe par frames)
+- 🖼 **Tous les formats** : photos JPG/PNG/GIF/WebP/**HEIC**/HEIF/AVIF/TIFF/BMP/**RAW** (DNG/CR2/NEF/ARW…) et vidéos MP4/MOV/M4V/AVI/MKV/WMV/3GP/MTS/WEBM…
+- 📅 **Date fiable (métadonnées)** : l'année affichée vient de l'EXIF (`DateTimeOriginal`) ou du `creation_time` vidéo, jamais d'une simple date de fichier. La compression **préserve** EXIF/GPS/date.
+- 📊 **Tri par volume** : traite d'abord les fichiers les plus lourds, ou parcours une galerie triable par taille / date / nom.
 - 💾 **100% local** : aucun upload, aucune télémétrie, aucune dépendance cloud
 - ⏯️ **Reprise de session** : ferme et reprends quand tu veux, l'état est sauvegardé par config (sources × options)
-- 📦 **Compression pré-triage** : convertit JPG/PNG en WebP et MP4/MOV en H.265 avant tri. 3 presets (Sans perte / Équilibré / Compact). Gain disque ~30-90% selon preset.
+- 📦 **Compression pré-triage** : toutes les photos → WebP, toutes les vidéos → H.265, **métadonnées conservées**. 3 presets (Sans perte / Équilibré / Compact). Gain disque ~30-90% selon preset.
 - 🔜 **Recherche sémantique CLIP** : prévue pour v0.5.0 (gain de 2 GB sur le bundle actuel — désactivée pour rester téléchargeable rapidement)
 
 ## Installation

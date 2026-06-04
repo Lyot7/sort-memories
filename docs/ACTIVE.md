@@ -1,10 +1,20 @@
 # État actuel du projet
 
-**Dernière mise à jour** : 2026-05-23
+**Dernière mise à jour** : 2026-06-04
 
 ## En cours
 
-Rien — v0.1.0 livrée et téléchargeable.
+v0.6.0 implémentée (tous formats + métadonnées préservées + tri par volume), au-dessus de la v0.5.0 (HEIC + auto-update). Vérifiée par tests sur fixtures. Reste : merge de `feat/v0.5.0-heic-formats` pour récupérer l'auto-update, rebuild du `.app`, test manuel de la fenêtre pywebview avant release.
+
+## Fait récemment (v0.6.0)
+
+- [x] **Tous formats** photo (HEIC/HEIF/AVIF/TIFF/BMP/RAW) + vidéo (AVI/MKV/M4V/WMV/3GP/MTS/WEBM…) sur toute l'app
+- [x] **Métadonnées préservées** à la compression (EXIF/ICC/XMP sur WebP, `-map_metadata` sur H.265, `os.utime` mtime)
+- [x] **Année fiable** via `_capture_datetime` (EXIF/creation_time/nom/mtime) — corrige le bug « tout en 2026 »
+- [x] **Rangement par vraie date** de capture (`compute_keep_destination`)
+- [x] **Endpoint `/preview`** JPEG pour formats non rendus par WKWebView (RAW, AVI/MKV…)
+- [x] **Tri par volume** : option de file `order=largest` + galerie triable `/api/gallery`
+- [x] deps `pillow-heif`/`rawpy`/`exifread` + spec PyInstaller (libheif/libraw bundlés)
 
 ## À faire (v0.2.0)
 

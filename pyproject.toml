@@ -1,6 +1,6 @@
 [project]
 name = "sort-memories"
-version = "0.4.0"
+version = "0.6.0"
 description = "Desktop app to sort and dedupe local media folders (macOS, soon multi-platform)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,9 @@ dependencies = [
     "pywebview>=5.0",
     "appdirs>=1.4",
     "send2trash>=1.8",
+    "pillow-heif>=0.16",
+    "rawpy>=0.21",
+    "exifread>=3.0",
 ]
 
 [project.optional-dependencies]
