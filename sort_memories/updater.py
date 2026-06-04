@@ -18,7 +18,6 @@ import sys
 import tempfile
 import urllib.request
 import urllib.error
-import zipfile
 from pathlib import Path
 
 from sort_memories import __version__ as CURRENT_VERSION
@@ -168,8 +167,11 @@ if [ -d "$TARGET" ]; then
   fi
 fi
 
-# Copie atomique du nouveau .app
+# Copie atomique du nouveau .app (ditto préserve symlinks + permissions)
 ditto "$NEW_APP" "$TARGET"
+
+# Garde-fou : garantir le bit exécutable sur le binaire principal
+chmod +x "$TARGET/Contents/MacOS/"* 2>/dev/null || true
 
 # Relance
 open -a "$TARGET"
@@ -198,10 +200,17 @@ def install_release(zip_path: Path, on_ready=None) -> None:
             "L'auto-update fonctionne uniquement depuis l'app installée (pas en dev)."
         )
 
-    # Extract dans /tmp
+    # Extract dans /tmp via `ditto -x -k` (PAS zipfile.extractall : ce dernier
+    # APLATIT les symlinks en fichiers et PERD le bit exécutable → bundle .app
+    # corrompu, "Impossible d'ouvrir l'application". ditto préserve symlinks,
+    # permissions et resource forks, exactement comme `ditto -c -k` à la création.
     extract_dir = Path(tempfile.mkdtemp(prefix="sortmem-update-"))
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
+    r = subprocess.run(
+        ["ditto", "-x", "-k", str(zip_path), str(extract_dir)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"Échec extraction (ditto): {(r.stderr or '')[:200]}")
 
     # Localiser le .app dans l'extract
     new_app = None
@@ -211,6 +220,17 @@ def install_release(zip_path: Path, on_ready=None) -> None:
             break
     if new_app is None:
         raise RuntimeError("Le zip téléchargé ne contient pas Sort Memories.app à la racine.")
+
+    # Garde-fou : le binaire doit exister ET être exécutable, sinon l'app ne
+    # s'ouvrira pas. Si ditto a fait son travail c'est déjà bon ; on force par
+    # sécurité (défense en profondeur).
+    main_exe = new_app / "Contents" / "MacOS" / "SortMemories"
+    if not main_exe.exists():
+        raise RuntimeError("Bundle téléchargé invalide : binaire principal absent.")
+    try:
+        main_exe.chmod(main_exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        pass
 
     # Génère le script relauncher
     script_path = extract_dir / "_relauncher.sh"

@@ -1,5 +1,22 @@
 # Changelog
 
+## [2026-06-04] v0.6.1 — hotfix auto-update (bundle corrompu)
+
+**Type** : Bugfix (critique)
+**Fichiers modifiés** : `sort_memories/updater.py`
+
+**Symptôme** : après une mise à jour via l'interface, l'app ne se lançait plus (« Impossible d'ouvrir l'application »).
+
+**Cause racine** : l'auto-updater décompressait le zip avec `zipfile.ZipFile.extractall`, qui **aplatit les symlinks en fichiers** et **perd le bit exécutable**. Le `.app` macOS contient 73 symlinks (versions de dylibs libheif/libde265/libraw, framework Python) + le binaire `Contents/MacOS/SortMemories` qui doit être exécutable → bundle corrompu à l'installation. Bug présent depuis la v0.5.0 (updater inchangé), devenu fatal en v0.6.0 avec l'ajout des libs natives RAW/HEIC.
+
+**Correctif** :
+- Extraction via `ditto -x -k` (préserve symlinks + permissions + resource forks, comme `ditto -c -k` à la création du zip).
+- Garde-fou : vérification de présence + `chmod +x` du binaire principal après extraction, et `chmod +x` défensif dans le script relauncher après le `ditto` de copie.
+
+**Vérification** : round-trip prouvé — `zipfile.extractall` → 0 symlink / non-exécutable (reproduit le bug) ; `ditto -x -k` → symlinks + exécutable préservés.
+
+**⚠️ Limite des auto-updaters** : c'est la version **installée** qui exécute l'extraction. Une app en v0.5.0/v0.6.0 corrompra toujours sa cible en auto-update. Il faut installer la v0.6.1 **manuellement une fois** ; à partir de la v0.6.1, l'auto-update fonctionne.
+
 ## [2026-06-04] v0.6.0 — tous formats + métadonnées préservées + tri par volume
 
 > S'appuie sur la v0.5.0 (HEIC iPhone + formats vidéo + auto-update). Cette version ajoute RAW/AVIF, la préservation des métadonnées, le fix de l'année, le preview et le tri par volume.
