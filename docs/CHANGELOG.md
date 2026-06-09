@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026-06-09] v0.8.1 : fix année affichée (sous-IFD Exif, pas le mtime)
+
+**Type** : Bugfix
+**Fichiers modifiés** : `sort_memories/core.py` (`_exif_datetime`)
+
+**Symptôme** : l'année affichée dans l'interface était fausse (souvent l'année de conversion/fichier au lieu de l'année de prise de vue), surtout après une compression WebP/H.265 qui réécrit la date du fichier.
+
+**Cause racine** : `_exif_datetime` lisait `DateTimeOriginal` (tag 36867) et `DateTimeDigitized` (36868) sur l'IFD0. Or ces tags vivent dans le **sous-IFD Exif** (pointeur `0x8769`), pas dans l'IFD0. `exif.get(36867)` renvoyait donc toujours `None`, et le code retombait sur le `mtime` du fichier (modifié par la conversion). L'année de capture réelle n'était jamais lue pour les formats lus par Pillow (JPEG/HEIC/WebP).
+
+**Correctif** : lecture du sous-IFD via `exif.get_ifd(0x8769)`, avec priorité `DateTimeOriginal > DateTimeDigitized > DateTime (306, IFD0)`. Le fallback exifread (RAW/TIFF) et ffprobe `creation_time` (vidéo) restent inchangés.
+
+**Vérification** : test unitaire sur WebP (DateTimeOriginal 2018, mtime forcé 2024 → renvoie 2018) et JPEG (2015 vs mtime 2024 → renvoie 2015). Lint ruff vert.
+
 ## [2026-06-08] v0.8.0 : refonte UI complète « Calme & Pro »
 
 **Type** : Refonte (design UI/UX)

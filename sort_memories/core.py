@@ -1068,11 +1068,18 @@ def _exif_datetime(p: Path):
     Priorité tags : DateTimeOriginal (36867) > DateTimeDigitized (36868) > DateTime (306).
     Couvre JPEG/TIFF/PNG/HEIC (via pillow_heif). Fallback exifread pour RAW/TIFF.
     """
-    # 1) Pillow getexif (rapide, couvre la majorité)
+    # 1) Pillow getexif (rapide, couvre la majorité).
+    #    IMPORTANT : DateTimeOriginal (36867) et DateTimeDigitized (36868) vivent
+    #    dans le SOUS-IFD Exif (pointeur 0x8769), pas dans l'IFD0. Les lire via
+    #    get_ifd(0x8769). Sinon exif.get(36867) renvoie toujours None et on
+    #    retombe sur le mtime (faux après une conversion qui réécrit la date fichier).
     try:
         exif = Image.open(p).getexif()
-        for tag in (36867, 36868, 306):
-            val = exif.get(tag)
+        try:
+            sub = exif.get_ifd(0x8769)   # ExifTags.IFD.Exif
+        except Exception:
+            sub = {}
+        for val in (sub.get(36867), sub.get(36868), exif.get(306)):
             if val:
                 try:
                     return _datetime.datetime.strptime(str(val).strip(), "%Y:%m:%d %H:%M:%S")
