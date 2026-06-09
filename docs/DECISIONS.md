@@ -1,5 +1,21 @@
 # Décisions techniques
 
+## [2026-06-08] Trim asynchrone, galerie à plat, filtre transient (v0.7.0)
+
+**Contexte** : ajout de 4 chantiers UX. Trois choix d'architecture méritaient d'être tranchés.
+
+**1. Trim synchrone vs asynchrone**
+- Options : (a) garder `/api/transform` synchrone bloquant avec un simple spinner indéterminé ; (b) worker thread async + polling de la progression `ffmpeg -progress`.
+- Décision : (b). Le découpage ré-encode (libx264) et peut durer plusieurs minutes ; un spinner indéterminé n'empêche pas l'angoisse du « ça a planté ». Le pattern worker + polling existait déjà pour la conversion (`_convert_status`), donc cohérence interne et coût faible. `out_time_us` est parsé (fiable cross-build) plutôt que `out_time_ms` (microsecondes trompeuses selon les builds ffmpeg).
+
+**2. Mode galerie : à plat vs avec groupes de doublons**
+- Options : (a) réutiliser la détection pHash/CLIP dans la galerie ; (b) galerie à plat sur la file restante.
+- Décision : (b). La galerie est une *méthode de tri alternative* (vue d'ensemble, marquage par lot au clavier), pas un remplacement de la détection de doublons. Mélanger les deux compliquerait l'UI et le modèle mental. Les groupes restent en mode un par un. `/api/gallery_action` journalise chaque opération en `keep`/`trash` standard, donc l'undo existant fonctionne sans code spécifique.
+
+**3. Filtre par type : persistant vs transient sur le `current`**
+- Options : (a) avancer/sauvegarder `current` en sautant les fichiers hors filtre ; (b) calcul transient de l'index d'affichage sans toucher au `current` sauvegardé.
+- Décision : (b). Sauvegarder l'avance ferait « disparaître » définitivement les fichiers de l'autre type quand on change de filtre. Le calcul transient garantit qu'un retour à « Tout » réaffiche tout. Le re-scan au done (`_append_new_files`) ne tourne qu'à la frontière fin-de-file pour éviter un scan disque à chaque appel de `/api/state`.
+
 ## [2026-06-04] Préserver les métadonnées + dater par EXIF/creation_time
 
 **Contexte** : la compression v0.4.0 effaçait les métadonnées (EXIF/creation_time) et réécrivait le `mtime`. L'affichage de l'année reposait sur `nom → mtime`, d'où une vidéo de bébé affichée en 2026.
