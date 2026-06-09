@@ -1068,11 +1068,18 @@ def _exif_datetime(p: Path):
     Priorité tags : DateTimeOriginal (36867) > DateTimeDigitized (36868) > DateTime (306).
     Couvre JPEG/TIFF/PNG/HEIC (via pillow_heif). Fallback exifread pour RAW/TIFF.
     """
-    # 1) Pillow getexif (rapide, couvre la majorité)
+    # 1) Pillow getexif (rapide, couvre la majorité).
+    #    IMPORTANT : DateTimeOriginal (36867) et DateTimeDigitized (36868) vivent
+    #    dans le SOUS-IFD Exif (pointeur 0x8769), pas dans l'IFD0. Les lire via
+    #    get_ifd(0x8769). Sinon exif.get(36867) renvoie toujours None et on
+    #    retombe sur le mtime (faux après une conversion qui réécrit la date fichier).
     try:
         exif = Image.open(p).getexif()
-        for tag in (36867, 36868, 306):
-            val = exif.get(tag)
+        try:
+            sub = exif.get_ifd(0x8769)   # ExifTags.IFD.Exif
+        except Exception:
+            sub = {}
+        for val in (sub.get(36867), sub.get(36868), exif.get(306)):
             if val:
                 try:
                     return _datetime.datetime.strptime(str(val).strip(), "%Y:%m:%d %H:%M:%S")
@@ -1919,21 +1926,46 @@ def api_transform():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-def _save_image_in_place(img: Image.Image, p: Path, ext: str):
+def _exif_for_save(p: Path, reset_orientation: bool = False):
+    """Bytes EXIF de p à réinjecter lors d'une sauvegarde in-place.
+
+    Préserve la date de capture (DateTimeOriginal, sous-IFD 0x8769) et les autres
+    métadonnées lors d'une rotation/rognage. Si `reset_orientation`, force le tag
+    Orientation (274) à 1 : la rotation est déjà appliquée aux pixels, on évite donc
+    une double rotation à l'affichage. Retourne None si aucune EXIF lisible.
+    """
+    try:
+        if reset_orientation:
+            exif = Image.open(p).getexif()
+            if not exif:
+                return None
+            exif.get_ifd(0x8769)   # force le chargement du sous-IFD (DateTimeOriginal)
+            exif[274] = 1
+            return exif.tobytes()
+        return Image.open(p).info.get("exif")
+    except Exception:
+        return None
+
+
+def _save_image_in_place(img: Image.Image, p: Path, ext: str, exif=None):
     """Sauvegarde img au chemin p en respectant le format d'origine.
 
-    JPEG/HEIC nécessitent un mode RGB sans alpha. Les autres formats Pillow-natifs
-    sont sauvés directement. HEIC/HEIF requiert pillow-heif registered (HEIF_AVAILABLE).
+    JPEG/HEIC nécessitent un mode RGB sans alpha. `exif` (bytes) est réinjecté pour
+    les formats qui le supportent, afin de préserver la date de capture après
+    rotation/rognage. HEIC/HEIF requiert pillow-heif registered (HEIF_AVAILABLE).
     """
+    kw = {"exif": exif} if exif else {}
     if ext in (".jpg", ".jpeg"):
         img = img.convert("RGB")
-        img.save(str(p), "JPEG", quality=95, subsampling=0)
+        img.save(str(p), "JPEG", quality=95, subsampling=0, **kw)
     elif ext in (".heic", ".heif"):
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
-        img.save(str(p), format="HEIF", quality=90)
+        img.save(str(p), format="HEIF", quality=90, **kw)
+    elif ext in (".webp", ".png", ".tiff", ".tif"):
+        img.save(str(p), **kw)
     else:
-        img.save(str(p))
+        img.save(str(p))   # gif/bmp : pas de conteneur EXIF
 
 
 def _do_rotate(p: Path, angle: int):
@@ -1950,7 +1982,8 @@ def _do_rotate(p: Path, angle: int):
             rotated = img.transpose(Image.Transpose.ROTATE_90)
         else:
             return jsonify({"ok": False, "error": "angle doit être 90/180/270"}), 400
-        _save_image_in_place(rotated, p, ext)
+        exif = _exif_for_save(p, reset_orientation=True)   # préserve la date, neutralise l'orientation
+        _save_image_in_place(rotated, p, ext, exif)
         return jsonify({"ok": True, "kind": "image", "angle": angle})
 
     if ext in VIDEO_EXT:
@@ -1986,7 +2019,8 @@ def _do_crop(p: Path, x: int, y: int, w: int, h: int):
     if right - left < 4 or bottom - top < 4:
         return jsonify({"ok": False, "error": "zone de crop trop petite"}), 400
     cropped = img.crop((left, top, right, bottom))
-    _save_image_in_place(cropped, p, ext)
+    exif = _exif_for_save(p)   # verbatim : préserve la date de capture (pas de rotation)
+    _save_image_in_place(cropped, p, ext, exif)
     return jsonify({"ok": True, "kind": "image",
                     "crop": {"x": left, "y": top, "w": right - left, "h": bottom - top}})
 
