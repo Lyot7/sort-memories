@@ -55,7 +55,7 @@ jobs:
         if: steps.check.outputs.exists == 'false'
         run: |
           python -m pip install --upgrade pip
-          pip install flask pillow pillow-heif rawpy exifread imagehash numpy pywebview appdirs send2trash pyinstaller
+          pip install flask pillow pillow-heif rawpy exifread imagehash numpy pywebview appdirs send2trash certifi pyinstaller
 
       - name: Build PyInstaller
         if: steps.check.outputs.exists == 'false'
