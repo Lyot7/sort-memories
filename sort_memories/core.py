@@ -673,7 +673,7 @@ def videos_similar(hashes1, hashes2) -> bool:
     if len(hashes1) < 2 or len(hashes2) < 2:
         return False
     matches = sum(
-        1 for h1, h2 in zip(hashes1, hashes2)
+        1 for h1, h2 in zip(hashes1, hashes2, strict=False)
         if not (imagehash.hex_to_hash(h1) - imagehash.hex_to_hash(h2) > HASH_THRESHOLD)
     )
     return matches >= VIDEO_MATCH
@@ -856,7 +856,7 @@ def build_clip_groups(embeddings, rels: list, sharpness: dict):
         batch = emb_n[i:i+chunk]
         sims  = batch @ emb_n.T
         rows, cols = np.where(sims >= CLIP_THRESHOLD)
-        for bi, j in zip(rows, cols):
+        for bi, j in zip(rows, cols, strict=False):
             gi = i + bi
             if j <= gi:
                 continue

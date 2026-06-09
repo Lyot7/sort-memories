@@ -22,27 +22,24 @@ App desktop de tri/déduplication de médias locaux (macOS). Les règles globale
 
 ## Versioning & release — RÈGLE
 
-**À chaque PR qui modifie le comportement ou l'UI : bumper la version ET pousser le tag.**
+**À chaque PR qui modifie le comportement ou l'UI : bumper la version. La release est automatique au merge.**
 
 1. **Bumper la version** dans les deux fichiers, gardés synchrones (semver `X.Y.Z`) :
    - `sort_memories/__init__.py` → `__version__`
    - `pyproject.toml` → `version`
-2. **Créer et pousser un tag annoté** au format **`vX.Y.Z`** (préfixe `v`) sur le commit de la PR :
-   ```bash
-   git tag -a vX.Y.Z -m "Sort Memories vX.Y.Z : <résumé>"
-   git push origin vX.Y.Z
-   ```
-   Les merges étant des merge commits (pas de squash), le commit taggé reste dans l'historique de `main`.
-3. **Pour activer l'update in-app**, le tag seul ne suffit pas : après merge sur `main`, publier une **Release GitHub** `vX.Y.Z` avec le `.app` zippé en asset (l'updater cherche un `.zip` nommé `*macos*`) :
-   ```bash
-   ./scripts/build-macos.sh                                   # build PyInstaller .app
-   ditto -c -k --keepParent dist/SortMemories.app SortMemories-macos.zip
-   gh release create vX.Y.Z SortMemories-macos.zip --title "..." --notes "..."
-   ```
-   **Toujours `ditto`, jamais `zip`/`zipfile` brut** : `ditto` préserve les symlinks et le bit exécutable du bundle. Un zip brut corrompt le `.app` à l'installation (bug fatal corrigé en v0.6.1).
-4. Synchroniser les références de version dans `README.md` et `docs/` (CHANGELOG, ACTIVE).
+2. **Synchroniser** les références de version dans `README.md` et `docs/` (CHANGELOG, ACTIVE).
+3. **Au merge dans `main`, la CI fait le reste** (`.github/workflows/release.yml`, runner macOS) : si la version n'a pas encore de Release GitHub, elle build le `.app` (PyInstaller), le zippe via `ditto` (asset `SortMemories-macos-vX.Y.Z.zip`, nom contenant `macos` que l'updater matche) et publie la **Release `vX.Y.Z`**. Idempotent : si la Release existe déjà, le job ne fait rien. L'update in-app se déclenche alors tout seul.
 
-**Pas de CI** : aucun workflow GitHub Actions ne build/release sur push de tag. Build et release sont **manuels**. Ne jamais supposer qu'un tag déclenche une release.
+Donc : **plus de tag ni de release manuels**. Un simple bump de version + merge suffit. Pour re-publier sans changer de version, supprimer d'abord la Release existante (le garde-fou bloque sinon).
+
+**`ditto` obligatoire** (encodé dans le workflow) : préserve symlinks + bit exécutable du bundle. Un `zip`/`zipfile` brut corrompt le `.app` à l'installation (bug fatal corrigé en v0.6.1).
+
+## CI (GitHub Actions)
+
+- **`.github/workflows/ci.yml`** (sur PR vers `main`) : lint ruff (Linux, rapide) + build sanity du `.app` (macOS). Les PR purement docs (`**.md`, `docs/**`) ne déclenchent rien.
+- **`.github/workflows/release.yml`** (sur push `main`) : build + publication de la Release décrites ci-dessus.
+- **Build manuel local** si besoin : `./scripts/build-macos.sh` (génère `dist/Sort Memories.app` + le zip `ditto`).
+- **Lint local** : `.venv/bin/ruff check sort_memories/` doit être vert. Le gros `core.py` (UI embarquée) a des `per-file-ignores` dans `pyproject.toml` (E501/E402/SIM) ; ne pas les retirer sans raison.
 
 ## Conventions
 
