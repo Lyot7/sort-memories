@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026-06-09] v0.8.2 : préserver l'EXIF lors de la rotation et du rognage
+
+**Type** : Bugfix
+**Fichiers modifiés** : `sort_memories/core.py` (`_save_image_in_place`, `_do_rotate`, `_do_crop`, nouveau `_exif_for_save`)
+
+**Symptôme** : après une rotation (T) ou un rognage (R), l'année d'une photo redevenait fausse, même après le fix v0.8.1. `_save_image_in_place` réécrivait l'image **sans** réinjecter l'EXIF, donc `DateTimeOriginal` était perdu et `_capture_datetime` retombait sur le `mtime`.
+
+**Correctif** : nouveau helper `_exif_for_save(p, reset_orientation)` qui récupère l'EXIF d'origine et le passe à `save(..., exif=...)`.
+- **Rognage** : EXIF réinjecté verbatim (préserve date, GPS, etc.).
+- **Rotation** : EXIF réinjecté avec le tag Orientation (274) remis à 1, puisque les pixels sont déjà physiquement tournés (évite une double rotation à l'affichage).
+- Formats couverts : JPEG, HEIC/HEIF, WebP, PNG, TIFF. GIF/BMP n'ont pas de conteneur EXIF (sauvés tels quels, comme avant).
+
+**Vérification** : test end-to-end JPEG + WebP + HEIC (capture 2018, mtime forcé 2024) → après rotation puis rognage, l'année reste **2018** et l'orientation est neutralisée à 1. Lint ruff vert, AST OK.
+
 ## [2026-06-09] v0.8.1 : fix année affichée (sous-IFD Exif, pas le mtime)
 
 **Type** : Bugfix
