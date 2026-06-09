@@ -1,5 +1,38 @@
 # Changelog
 
+## [2026-06-08] v0.8.0 : refonte UI complète « Calme & Pro »
+
+**Type** : Refonte (design UI/UX)
+**Fichiers modifiés** : `sort_memories/core.py` (bloc `<style>` réécrit, HTML restructuré, JS chrome), `sort_memories/__init__.py`, `pyproject.toml`
+
+**Contexte** : l'interface accumulait des couleurs et des contrôles hétérogènes (violet, orange, boutons mêlés sur une seule barre du bas). Brief : penser en designer UI/UX, direction « calme & pro » type Apple Photos, priorité lisibilité et réassurance, garder/supprimer par boutons + clavier, refonte de tous les écrans. La logique et le backend (license, auto-update, CLIP, conversion, crop/trim) restent intacts.
+
+**Ce qui a été fait** :
+- **Design system from scratch** : tokens `:root` (échelle de gris neutre proche Apple dark, couleurs système garder=vert / supprimer=rouge / bleu / ambre / violet, rayons, ombres douces, easing, `prefers-reduced-motion`). Tout le CSS réécrit autour de ces tokens.
+- **Nouveau chrome en deux barres** : un `#topbar` translucide (nom du média + position à gauche, filtre segmenté Tout/Photos/Vidéos + galerie + vider + accueil à droite) et une barre d'action basse zonée (Annuler + outils contextuels à gauche, gros boutons Supprimer/Garder à droite avec raccourcis lisibles).
+- **Le média est la star** : il flotte au centre avec une ombre douce et des coins arrondis, marges généreuses, chrome qui s'efface.
+- **Tous les écrans harmonisés** : accueil (carte centrée, dégradé radial, options en cartes), écran terminé (CTA clairs), mode galerie (cartes nettes, états garder/supprimer, focus clavier visible), overlay de traitement (spinner + barre arrondie), modales, crop/trim, toasts, paywall, doublons.
+- **Réassurance** : Annuler toujours visible, libellés explicites, segmented control pour le filtre, hiérarchie typographique nette, micro-interactions sobres (hover, active, lift des cartes).
+
+**Vérification** : inspection navigateur de chaque écran (single photo + vidéo, accueil, terminé, galerie avec marquage, overlay de progression, modale de confirmation, overlay de rognage) sans erreur console. Lint ruff : zéro nouvelle erreur en code Python. Backend et contrats JS (125 IDs) préservés.
+
+## [2026-06-08] v0.7.0 : anti-blocage, progression trim, mode galerie, tri photos/vidéos
+
+**Type** : Feature (4 chantiers)
+**Fichiers modifiés** : `sort_memories/core.py`, `sort_memories/__init__.py`, `pyproject.toml`
+
+**Contexte** : quatre frictions remontées à l'usage. (1) En rouvrant l'app après un tri fini, on tombait sur l'écran « Tri terminé » sans aucune action possible (cul-de-sac). (2) Le découpage vidéo (ffmpeg, parfois plusieurs minutes) ne donnait aucun retour : l'utilisateur faisait « Retour » en croyant à un plantage. (3) Une seule méthode de tri (un par un). (4) Mêmes contrôles pour photos et vidéos, interface indifférenciée.
+
+**Ce qui a été fait** :
+- **Anti-blocage + re-scan auto** : `/api/state` cherche les nouveaux médias des dossiers avant de déclarer le tri fini (`_append_new_files`) et reprend automatiquement s'il y en a. L'écran « terminé » expose désormais des CTA : rechercher de nouveaux médias (`/api/refresh_queue`), vider la corbeille, galerie, changer de dossiers.
+- **Progression réelle du trim** : le découpage passe par un worker asynchrone (`/api/trim/start` + `/api/trim/status`) qui parse la progression ffmpeg (`-progress`). Un overlay plein écran affiche un pourcentage réel, le temps écoulé, un message « ne quittez pas / ne faites pas Retour », et bloque la navigation (clavier + bouton Retour) pendant l'encodage.
+- **Mode galerie de tri** (photos ET vidéos) : alternative au un par un. Grille avec navigation clavier (flèches), marquage garder (Espace/K) / supprimer (D), annulation (U), validation par lot (Entrée), retour (Échap). Backend : `/api/gallery?scope=queue&type=...` + `/api/gallery_action`. L'undo standard reste fonctionnel.
+- **Filtre par type + contrôles contextuels** : sélecteur Tout / Photos / Vidéos (`/api/triage_filter`, `/api/queue_stats`) qui filtre la file ; la barre n'affiche que les actions pertinentes (rogner pour une photo, lecteur + découper pour une vidéo).
+
+**Vérification** : suite end-to-end via `app.test_client` (config, filtre, galerie batch, trim async avec progression 0 puis 100, re-scan auto au done) plus inspection visuelle du frontend (mode single photo et vidéo, mode galerie avec marquage, écran terminé avec CTA, overlay de progression) sans erreur console. Lint ruff : zéro nouvelle erreur en code Python.
+
+**Limite connue** : le mode galerie ne surface pas les groupes de doublons pHash/CLIP (c'est une méthode de tri à plat, volontairement). La détection de doublons reste disponible en mode un par un.
+
 ## [2026-06-04] v0.6.1 — hotfix auto-update (bundle corrompu)
 
 **Type** : Bugfix (critique)

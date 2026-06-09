@@ -1,12 +1,26 @@
 # État actuel du projet
 
-**Dernière mise à jour** : 2026-06-04
+**Dernière mise à jour** : 2026-06-08
 
 ## En cours
 
-v0.6.0 implémentée (tous formats + métadonnées préservées + tri par volume), mergée au-dessus de la v0.5.0 (HEIC + auto-update). Vérifiée par tests sur fixtures. Reste : rebuild du `.app` (`./scripts/build-macos.sh`) + test manuel sur dossier iPhone (HEIC + MOV) avant release. Roadmap commerciale macOS : cf. `~/.claude/plans/en-vrai-l-application-est-drifting-avalanche.md`.
+v0.8.0 implémentée : refonte UI complète « Calme & Pro » (design system from scratch, chrome en deux barres, tous les écrans harmonisés). Backend et logique inchangés. Vérifiée par inspection visuelle de chaque écran (zéro erreur console). Reste : rebuild du `.app` (`./scripts/build-macos.sh`) + test manuel sur un dossier iPhone réel (HEIC + MOV) avant release.
 
-## Fait récemment (v0.6.0)
+## Fait récemment (v0.8.0)
+
+- [x] **Design system from scratch** : tokens `:root` (gris neutre Apple, couleurs système, rayons, ombres, motion, prefers-reduced-motion)
+- [x] **Chrome en deux barres** : `#topbar` (contexte + filtre segmenté + utilitaires) et barre d'action basse zonée (Annuler/outils + gros Supprimer/Garder)
+- [x] **Média mis en avant** : ombre douce, coins arrondis, marges généreuses, UI qui s'efface
+- [x] **Tous les écrans harmonisés** : accueil, terminé, galerie, overlay de traitement, modales, crop/trim, toasts, paywall, doublons
+
+## Fait précédemment (v0.7.0)
+
+- [x] **Anti-blocage** : écran « terminé » avec CTA (rechercher de nouveaux médias, vider la corbeille, galerie, changer de dossiers) + re-scan auto au démarrage (`_append_new_files`, `/api/refresh_queue`)
+- [x] **Progression réelle du trim** : worker async `/api/trim/start` + `/api/trim/status` (parse `ffmpeg -progress`), overlay plein écran avec pourcentage, temps écoulé, message anti-Retour et blocage navigation
+- [x] **Mode galerie de tri** photos ET vidéos : grille clavier (flèches, Espace/K garder, D supprimer, U annuler, Entrée valider, Échap revenir), `/api/gallery?scope=queue` + `/api/gallery_action`, undo conservé
+- [x] **Filtre par type** Tout/Photos/Vidéos (`/api/triage_filter`, `/api/queue_stats`) + barre contextuelle (rogner photo, lecteur + découper vidéo)
+
+## Fait précédemment (v0.6.0)
 
 - [x] **Tous formats** photo (HEIC/HEIF/AVIF/TIFF/BMP/RAW) + vidéo (AVI/MKV/M4V/WMV/3GP/MTS/WEBM…) sur toute l'app
 - [x] **Métadonnées préservées** à la compression (EXIF/ICC/XMP sur WebP, `-map_metadata` sur H.265, `os.utime` mtime)

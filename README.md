@@ -83,6 +83,9 @@ Signature Apple Developer ID + notarisation arrivent avec la version commerciale
 - [x] Rotation T, crop/trim R, vider corbeille send2trash (v0.3.0)
 - [x] Compression pré-triage WebP + H.265, 3 presets (v0.4.0)
 - [x] Support HEIC iPhone + formats vidéo étendus (v0.5.0)
+- [x] Tous formats + métadonnées préservées + tri par volume (v0.6.0)
+- [x] Anti-blocage écran terminé + re-scan auto, progression réelle du trim, mode galerie de tri, filtre photos/vidéos (v0.7.0)
+- [x] Refonte UI complète « Calme & Pro » (design system, chrome deux barres, tous les écrans) (v0.8.0)
 - [ ] Signature + notarisation Apple Developer ID — version commerciale T2 2026
 - [ ] Landing site + LemonSqueezy paywall + trial server-side — version commerciale T2 2026
 - [ ] CI/CD GitHub Actions (build .dmg sur tag, runner macos-14) — version commerciale T2 2026

@@ -141,6 +141,21 @@ def _is_web_renderable(rel: str) -> bool:
     """True si WKWebView peut afficher le fichier directement (sinon preview JPEG)."""
     return Path(rel).suffix.lower() in (WEB_IMG_EXT | WEB_VIDEO_EXT)
 
+def _entry_is_video(entry: str) -> bool:
+    """True si l'entry pointe vers une vidéo (selon l'extension)."""
+    return Path(_entry_rel(entry)).suffix.lower() in VIDEO_EXT
+
+def _entry_matches_filter(entry: str, ftype: str) -> bool:
+    """True si l'entry correspond au filtre de tri ('all' | 'photo' | 'video')."""
+    if ftype == "video":
+        return _entry_is_video(entry)
+    if ftype == "photo":
+        return not _entry_is_video(entry)
+    return True
+
+# Filtre de tri actif (en mémoire, partagé single + galerie) : 'all' | 'photo' | 'video'.
+_triage_filter = "all"
+
 DEFAULT_OPTIONS = {
     "by_year":     True,
     "by_month":    False,
@@ -1174,6 +1189,25 @@ def collect_files():
             files.append(_make_entry(idx, str(f.relative_to(src))))
     return files
 
+def _append_new_files() -> int:
+    """Ajoute à la file de tri tout média présent sur le disque mais absent de la file.
+
+    Sert au re-scan automatique : quand on rouvre l'app après un tri terminé, de
+    nouveaux fichiers ont pu être ajoutés aux dossiers sources. On les enfile à la
+    suite pour reprendre le tri sans repartir de zéro. Retourne le nombre ajouté.
+    """
+    if not _is_configured():
+        return 0
+    s        = load_state()
+    existing = set(s.get("files", []))
+    new      = [e for e in collect_files()
+                if e not in existing and _entry_path(e).exists()]
+    if not new:
+        return 0
+    s["files"] = s.get("files", []) + new
+    save_state(s)
+    return len(new)
+
 def find_overlay(entry):
     """Trouve l'overlay -overlay.png correspondant à un fichier -main.<ext>.
 
@@ -1294,6 +1328,42 @@ def api_rescan():
     threading.Thread(target=scan_and_update, daemon=True).start()
     return jsonify({"ok": True})
 
+@app.route("/api/refresh_queue", methods=["POST"])
+def api_refresh_queue():
+    """Re-scan manuel : enfile les nouveaux médias des dossiers sources (CTA écran fin)."""
+    if not _is_configured():
+        return jsonify({"ok": False, "error": "session non configurée"}), 400
+    added = _append_new_files()
+    return jsonify({"ok": True, "added": added})
+
+@app.route("/api/triage_filter", methods=["POST"])
+def api_triage_filter():
+    """Définit le filtre de tri par type de média : 'all' | 'photo' | 'video'."""
+    global _triage_filter
+    data  = request.get_json() or {}
+    value = data.get("value", "all")
+    if value not in ("all", "photo", "video"):
+        return jsonify({"ok": False, "error": "valeur invalide"}), 400
+    _triage_filter = value
+    return jsonify({"ok": True, "filter": _triage_filter})
+
+@app.route("/api/queue_stats")
+def api_queue_stats():
+    """Comptes des médias restant à trier, par type (pour le sélecteur Tout/Photos/Vidéos)."""
+    if not _is_configured():
+        return jsonify({"photo": 0, "video": 0, "total": 0, "filter": _triage_filter})
+    s       = load_state()
+    files   = s.get("files", [])
+    idx     = s.get("current", 0)
+    pending = [f for f in files[idx:] if _entry_path(f).exists()]
+    n_video = sum(1 for f in pending if _entry_is_video(f))
+    return jsonify({
+        "photo":  len(pending) - n_video,
+        "video":  n_video,
+        "total":  len(pending),
+        "filter": _triage_filter,
+    })
+
 @app.route("/api/license", methods=["GET"])
 def api_license_status():
     lic = _load_license()
@@ -1327,6 +1397,19 @@ def api_clip_rescan():
     threading.Thread(target=scan_clip, daemon=True).start()
     return jsonify({"ok": True, "available": CLIP_AVAILABLE})
 
+def _state_done_payload(files, idx):
+    """Payload 'tri terminé' enrichi des comptes restants par type (pour les CTA/filtre)."""
+    pending = [f for f in files[idx:] if _entry_path(f).exists()]
+    n_video = sum(1 for f in pending if _entry_is_video(f))
+    return jsonify({
+        "done":          True,
+        "total":         len(files),
+        "pending":       len(pending),
+        "pending_photo": len(pending) - n_video,
+        "pending_video": n_video,
+        "filter":        _triage_filter,
+    })
+
 @app.route("/api/state")
 def api_state():
     # Si aucune session configurée → UI affiche la vue accueil.
@@ -1340,8 +1423,14 @@ def api_state():
     s          = load_state()
     idx, files = s["current"], s["files"]
 
+    # Re-scan auto : à la frontière "fin de file", chercher de nouveaux médias
+    # ajoutés aux dossiers depuis la dernière session avant de déclarer le tri fini.
     if idx >= len(files):
-        return jsonify({"done": True, "total": len(files)})
+        if _append_new_files():
+            s = load_state()
+            idx, files = s["current"], s["files"]
+        else:
+            return _state_done_payload(files, idx)
 
     # Sauter les fichiers absents du disque (déjà déplacés vers Gardés/ ou trashés)
     start_idx = idx
@@ -1352,7 +1441,27 @@ def api_state():
         save_state(s)
 
     if idx >= len(files):
-        return jsonify({"done": True, "total": len(files)})
+        if _append_new_files():
+            s = load_state()
+            files = s["files"]
+            while idx < len(files) and not _entry_path(files[idx]).exists():
+                idx += 1
+            if idx != s["current"]:
+                s["current"] = idx
+                save_state(s)
+        if idx >= len(files):
+            return _state_done_payload(files, idx)
+
+    # Filtre par type (transient : ne touche pas au current sauvegardé, pour qu'un
+    # changement de filtre révèle à nouveau les fichiers du type précédemment masqué).
+    if _triage_filter != "all":
+        j = idx
+        while j < len(files) and not (
+            _entry_path(files[j]).exists() and _entry_matches_filter(files[j], _triage_filter)):
+            j += 1
+        if j >= len(files):
+            return _state_done_payload(files, idx)
+        idx = j
 
     # Paywall essai gratuit
     processed = len(s.get("history", []))
@@ -1468,6 +1577,7 @@ def api_state():
         "source_idx":     src_idx,
         "source_name":    src_name,
         "sources_total":  len(_sources()),
+        "filter":         _triage_filter,
     })
 
 @app.route("/api/action", methods=["POST"])
@@ -1903,6 +2013,116 @@ def _do_trim(p: Path, start_s: float, end_s: float):
     tmp.replace(p)
     return jsonify({"ok": True, "kind": "video",
                     "trim": {"start_s": start_s, "end_s": end_s, "duration_s": end_s - start_s}})
+
+# ── Trim vidéo asynchrone avec progression (v0.7.0) ───────────────────────────
+# Le trim ré-encode (ffmpeg) et peut durer plusieurs minutes. On le lance dans un
+# thread worker et on expose une vraie progression %, comme la conversion.
+_trim_status = {
+    "running": False, "done": False, "ok": False, "error": None,
+    "percent": 0, "entry": "", "started_at": None, "finished_at": None,
+}
+_trim_lock   = threading.Lock()
+_trim_thread = None
+
+def _trim_worker(entry: str, start_s: float, end_s: float):
+    global _trim_status
+    import datetime as _dt
+    import tempfile
+    import time as _time
+    p      = _entry_path(entry)
+    ext    = p.suffix.lower()
+    target = max(0.001, end_s - start_s)
+    with _trim_lock:
+        _trim_status.update({
+            "running": True, "done": False, "ok": False, "error": None,
+            "percent": 0, "entry": entry,
+            "started_at": _dt.datetime.now().isoformat(), "finished_at": None,
+        })
+    if ext not in VIDEO_EXT:
+        with _trim_lock:
+            _trim_status.update({"running": False, "done": True, "ok": False,
+                                 "error": "trim disponible uniquement sur les vidéos"})
+        return
+
+    tmp     = p.with_name(f"_trim_{p.name}")
+    err_log = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+    err_log.close()
+    try:
+        with open(err_log.name, "w") as ef:
+            proc = subprocess.Popen([
+                "ffmpeg", "-y", "-ss", f"{start_s:.3f}", "-to", f"{end_s:.3f}",
+                "-i", str(p),
+                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "192k",
+                "-progress", "pipe:1", "-nostats",
+                str(tmp),
+            ], stdout=subprocess.PIPE, stderr=ef, text=True)
+            t0 = _time.monotonic()
+            for line in proc.stdout:
+                line = line.strip()
+                # out_time_us = position de sortie en microsecondes (fiable cross-build).
+                if line.startswith("out_time_us="):
+                    try:
+                        secs = int(line.split("=", 1)[1]) / 1_000_000.0
+                    except ValueError:
+                        continue
+                    pct = max(0, min(99, int(secs / target * 100)))
+                    with _trim_lock:
+                        _trim_status["percent"] = pct
+                if _time.monotonic() - t0 > 600:
+                    proc.kill()
+                    raise RuntimeError("timeout (10 min)")
+            proc.wait()
+
+        if proc.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            try:
+                msg = Path(err_log.name).read_text()[-300:]
+            except Exception:
+                msg = f"ffmpeg a échoué (code {proc.returncode})"
+            with _trim_lock:
+                _trim_status.update({"running": False, "done": True, "ok": False, "error": msg})
+            return
+
+        tmp.replace(p)
+        with _trim_lock:
+            _trim_status.update({"running": False, "done": True, "ok": True,
+                                 "percent": 100, "error": None,
+                                 "finished_at": _dt.datetime.now().isoformat()})
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        with _trim_lock:
+            _trim_status.update({"running": False, "done": True, "ok": False, "error": str(e)})
+    finally:
+        Path(err_log.name).unlink(missing_ok=True)
+
+@app.route("/api/trim/start", methods=["POST"])
+def api_trim_start():
+    global _trim_thread
+    data  = request.get_json() or {}
+    entry = data.get("entry")
+    if not entry:
+        return jsonify({"ok": False, "error": "entry manquant"}), 400
+    if not _entry_path(entry).exists():
+        return jsonify({"ok": False, "error": "fichier introuvable"}), 404
+    try:
+        start_s = float(data["start_s"])
+        end_s   = float(data["end_s"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"ok": False, "error": "start_s/end_s invalides"}), 400
+    if end_s <= start_s + 0.1:
+        return jsonify({"ok": False, "error": "end doit être > start + 0.1s"}), 400
+    with _trim_lock:
+        if _trim_status["running"]:
+            return jsonify({"ok": False, "error": "trim déjà en cours"}), 409
+    _trim_thread = threading.Thread(target=_trim_worker, args=(entry, start_s, end_s), daemon=True)
+    _trim_thread.start()
+    return jsonify({"ok": True})
+
+@app.route("/api/trim/status")
+def api_trim_status():
+    with _trim_lock:
+        return jsonify(dict(_trim_status))
 
 @app.route("/api/trash_info", methods=["GET"])
 def api_trash_info():
@@ -2344,12 +2564,32 @@ def serve_preview(entry):
 
 @app.route("/api/gallery")
 def api_gallery():
-    """Galerie de tous les médias, triable. ?sort=size_desc|size_asc|date_desc|date_asc|name."""
+    """Galerie de médias, triable.
+
+    Params :
+    - sort  : size_desc|size_asc|date_desc|date_asc|name
+    - scope : 'all' (défaut, tous les médias) | 'queue' (uniquement les médias
+              restant à trier, clés `rel` compatibles /api/gallery_action)
+    - type  : 'all' (défaut) | 'photo' | 'video'
+    """
     if not _is_configured():
         return jsonify({"ok": False, "error": "session non configurée"}), 400
-    sort = request.args.get("sort", "size_desc")
+    scope = request.args.get("scope", "all")
+    ftype = request.args.get("type", "all")
+    sort  = request.args.get("sort", "date_asc" if scope == "queue" else "size_desc")
+
+    if scope == "queue":
+        s        = load_state()
+        files    = s.get("files", [])
+        idx      = s.get("current", 0)
+        entries  = [f for f in files[idx:] if _entry_path(f).exists()]
+    else:
+        entries = collect_files()
+    if ftype in ("photo", "video"):
+        entries = [e for e in entries if _entry_matches_filter(e, ftype)]
+
     items = []
-    for entry in collect_files():
+    for entry in entries:
         rel_only = _entry_rel(entry)
         try:
             sz = _entry_path(entry).stat().st_size
@@ -2377,8 +2617,53 @@ def api_gallery():
     keyfn, rev = keyfns.get(sort, keyfns["size_desc"])
     items.sort(key=keyfn, reverse=rev)
     total_bytes = sum(it["size_bytes"] for it in items)
-    return jsonify({"ok": True, "sort": sort, "count": len(items),
+    return jsonify({"ok": True, "sort": sort, "scope": scope, "type": ftype,
+                    "count": len(items),
                     "total_mb": round(total_bytes / (1024 * 1024), 1), "items": items})
+
+@app.route("/api/gallery_action", methods=["POST"])
+def api_gallery_action():
+    """Applique un tri par lot depuis la galerie : {keep:[entries], trash:[entries]}.
+
+    Réutilise move_to_gardes / trash_file et journalise chaque opération dans
+    l'historique (l'undo standard de /api/action reste fonctionnel).
+    """
+    if not _is_configured():
+        return jsonify({"ok": False, "error": "session non configurée"}), 400
+    data       = request.get_json() or {}
+    keep_list  = data.get("keep", []) or []
+    trash_list = data.get("trash", []) or []
+    s          = load_state()
+    files_set  = set(s["files"])
+    processed  = 0
+
+    for rel in keep_list:
+        if rel not in files_set:
+            continue
+        ov     = find_overlay(rel)
+        result = move_to_gardes(rel, ov, True)
+        s["history"].append({"action": "keep", "file": rel,
+                             "kept_path": result["kept_path"]})
+        processed += 1
+
+    for rel in trash_list:
+        if rel not in files_set:
+            continue
+        dst   = trash_file(rel)
+        entry = {"action": "trash", "file": rel, "trash_path": dst}
+        ov    = find_overlay(rel)
+        if ov:
+            entry["overlay_rel"]        = ov
+            entry["overlay_trash_path"] = trash_file(ov)
+        s["history"].append(entry)
+        processed += 1
+
+    # Retirer de la file les fichiers traités (déplacés sur disque).
+    done_set   = set(keep_list) | set(trash_list)
+    s["files"] = [f for f in s["files"] if f not in done_set]
+    s["current"] = min(s["current"], len(s["files"]))
+    save_state(s)
+    return jsonify({"ok": True, "processed": processed})
 
 @app.route("/api/reorganize", methods=["POST"])
 def api_reorganize():
@@ -2515,521 +2800,559 @@ PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Triage Snapchat</title>
 <style>
+  /* ════════════════════════════════════════════════════════════════
+     Sort Memories — design system « Calme & Pro » (v0.8.0)
+     Direction : sombre neutre type Apple Photos. Le média est la star,
+     l'UI s'efface. Hiérarchie lisible, gros gestes garder/supprimer,
+     undo toujours visible, feedback rassurant.
+     ════════════════════════════════════════════════════════════════ */
+  :root {
+    /* Surfaces (échelle de gris neutre, proche Apple dark) */
+    --bg:        #0a0a0b;
+    --bg-1:      #161618;   /* barres, surfaces élevées */
+    --bg-2:      #1f1f22;   /* contrôles, hover */
+    --bg-3:      #2a2a2e;   /* hover fort, inputs */
+    --line:      rgba(255,255,255,.08);
+    --line-2:    rgba(255,255,255,.14);
+    /* Texte */
+    --txt:       #f5f5f7;
+    --txt-2:     #aeaeb2;
+    --txt-3:     #8e8e93;
+    --txt-4:     #7c7c82;   /* relevé pour passer WCAG AA (≈4.6:1 sur --bg) */
+    /* Accents sémantiques (couleurs système Apple) */
+    --keep:      #30d158;
+    --keep-bg:   rgba(48,209,88,.16);
+    --keep-line: rgba(48,209,88,.42);
+    --del:       #ff453a;
+    --del-bg:    rgba(255,69,58,.16);
+    --del-line:  rgba(255,69,58,.42);
+    --blue:      #0a84ff;
+    --blue-bg:   rgba(10,132,255,.16);
+    --amber:     #ff9f0a;
+    --amber-bg:  rgba(255,159,10,.15);
+    --violet:    #bf5af2;
+    --violet-bg: rgba(191,90,242,.16);
+    /* Rayons, ombres, motion */
+    --r-sm: 8px; --r-md: 12px; --r-lg: 16px; --r-pill: 999px;
+    --shadow: 0 16px 50px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+    --shadow-sm: 0 6px 24px rgba(0,0,0,.4);
+    --ease: cubic-bezier(.2,.7,.2,1);
+    --dur: .22s;
+  }
+
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body {
-    height: 100%; background: #0d0d0d; color: #fff;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    height: 100%; background: var(--bg); color: var(--txt);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    font-size: 14px; line-height: 1.45; letter-spacing: -.01em;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
     display: flex; flex-direction: column; overflow: hidden;
   }
+  ::selection { background: rgba(10,132,255,.35); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  }
 
-  #progress-wrap { height: 3px; background: #222; flex-shrink: 0; }
-  #progress-bar  { height: 100%; background: #22c55e; width: 0; transition: width .25s ease; }
+  /* Base bouton neutre — chaque composant affine ensuite */
+  button {
+    font-family: inherit; color: var(--txt);
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    border: none; border-radius: var(--r-sm); padding: 9px 15px;
+    font-size: 13px; font-weight: 600; cursor: pointer; flex-shrink: 0;
+    transition: background var(--dur) var(--ease), border-color var(--dur), color var(--dur), opacity .15s, transform .08s;
+  }
+  button:active:not(:disabled) { transform: scale(.97); }
+  button:disabled { opacity: .35; cursor: default; }
+  button:focus-visible, .tf-btn:focus-visible, input:focus-visible {
+    outline: 2px solid var(--blue); outline-offset: 2px;
+  }
+  .key {
+    font-size: 10px; font-weight: 600; opacity: .75;
+    background: rgba(255,255,255,.09); border-radius: 5px; padding: 1px 5px;
+    font-variant-numeric: tabular-nums; line-height: 1.4;
+  }
 
-  /* ── Stage (single mode) ── */
+  /* ── Barre de progression (fil très fin tout en haut) ── */
+  #progress-wrap { height: 2px; background: rgba(255,255,255,.06); flex-shrink: 0; }
+  #progress-bar  { height: 100%; background: var(--keep); width: 0; transition: width .35s var(--ease); }
+
+  /* ── Topbar : contexte du média + utilitaires (calme, translucide) ── */
+  #topbar {
+    flex-shrink: 0; display: none; align-items: center; gap: 12px;
+    padding: 10px 18px; min-height: 52px;
+    background: rgba(16,16,18,.72); backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--line);
+  }
+  #topbar.show { display: flex; }
+  #topbar .tb-left  { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+  #topbar .tb-right { display: flex; align-items: center; gap: 8px; }
+  #info { min-width: 0; }
+  #info .name { font-size: 13px; font-weight: 600; color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #info .meta { font-size: 11.5px; color: var(--txt-3); margin-top: 1px; font-variant-numeric: tabular-nums; }
+
+  /* Bouton outil discret (ghost) */
+  .toolbtn {
+    background: transparent; border: 1px solid var(--line); color: var(--txt-2);
+    border-radius: var(--r-sm); padding: 7px 12px; font-size: 12.5px; font-weight: 500;
+  }
+  .toolbtn:hover:not(:disabled) { background: var(--bg-2); color: var(--txt); border-color: var(--line-2); }
+  .toolbtn.icon { padding: 7px 10px; }
+
+  /* ── Stage (média en mode single) ── */
   #stage {
     flex: 1; display: flex; align-items: center; justify-content: center;
-    overflow: hidden; position: relative; padding: 8px; min-height: 0;
+    overflow: hidden; position: relative; padding: 28px; min-height: 0;
   }
   #media-wrap {
-    position: relative; display: inline-flex;
-    align-items: center; justify-content: center;
+    position: relative; display: inline-flex; align-items: center; justify-content: center;
     max-width: 100%; max-height: 100%; cursor: pointer;
   }
   #main-img {
-    display: block; max-width: 100%; max-height: calc(100vh - 100px);
-    object-fit: contain; border-radius: 4px; cursor: default;
+    display: block; max-width: 100%; max-height: calc(100vh - 200px);
+    object-fit: contain; border-radius: var(--r-md); cursor: default;
+    box-shadow: var(--shadow);
   }
   #main-video {
-    display: block; max-width: 100%; max-height: calc(100vh - 140px);
-    object-fit: contain; border-radius: 4px; background: #000;
+    display: block; max-width: 100%; max-height: calc(100vh - 220px);
+    object-fit: contain; border-radius: var(--r-md); background: #000;
+    box-shadow: var(--shadow);
   }
   #overlay-img {
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
     object-fit: contain; pointer-events: none;
-    transition: opacity .18s ease; border-radius: 4px;
+    transition: opacity var(--dur) var(--ease); border-radius: var(--r-md);
   }
   #overlay-img.hidden { opacity: 0; }
   #play-icon {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    font-size: 52px; opacity: 0; pointer-events: none; transition: opacity .15s ease;
+    width: 76px; height: 76px; border-radius: 50%;
+    background: rgba(0,0,0,.5); backdrop-filter: blur(8px);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 34px; color: #fff; opacity: 0; pointer-events: none;
+    transition: opacity .2s var(--ease), transform .2s var(--ease);
   }
-  #play-icon.show { opacity: .9; }
+  #play-icon.show { opacity: 1; }
   #overlay-badge {
-    position: absolute; top: 10px; right: 10px;
-    background: rgba(15,30,60,.82); color: #7dd3fc;
-    font-size: 11px; font-weight: 600; padding: 3px 9px;
-    border-radius: 20px; pointer-events: none; transition: opacity .2s;
+    position: absolute; top: 12px; right: 12px;
+    background: rgba(10,132,255,.9); color: #fff;
+    font-size: 11px; font-weight: 600; padding: 4px 11px;
+    border-radius: var(--r-pill); pointer-events: none; transition: opacity .2s;
   }
   #overlay-badge.hidden { opacity: 0; }
 
-  /* ── Group mode ── */
+  /* ── Mode doublons (pHash) ── */
   #group-stage {
     flex: 1; display: none; flex-direction: column;
-    padding: 8px; gap: 8px; min-height: 0; overflow: hidden;
+    padding: 16px 20px; gap: 14px; min-height: 0; overflow: hidden;
   }
-  #group-header {
-    flex-shrink: 0; display: flex; align-items: center; gap: 10px;
-    font-size: 13px; color: #aaa; padding: 2px 4px;
+  #group-header, #sem-header {
+    flex-shrink: 0; display: flex; align-items: center; gap: 12px;
+    font-size: 13px; color: var(--txt-2);
   }
-  #sim-badge {
-    padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 700;
-  }
-  .sim-green  { background: rgba(34,197,94,.2);  color: #4ade80; }
-  .sim-orange { background: rgba(251,146,60,.2); color: #fb923c; }
-  .sim-red    { background: rgba(239,68,68,.2);  color: #f87171; }
+  #group-count, #sem-count { font-weight: 600; color: var(--txt); }
+  #sim-badge { padding: 4px 12px; border-radius: var(--r-pill); font-size: 12px; font-weight: 700; }
+  .sim-green  { background: var(--keep-bg);   color: var(--keep); }
+  .sim-orange { background: var(--amber-bg);  color: var(--amber); }
+  .sim-red    { background: var(--del-bg);    color: var(--del); }
 
-  /* ── Semantic group (CLIP) ── */
-  #sem-stage {
-    flex: 1; display: none; flex-direction: column;
-    padding: 8px; gap: 6px; min-height: 0; overflow: hidden;
+  #group-grid, #sem-grid {
+    flex: 1; display: grid; gap: 14px; overflow: auto; min-height: 0; align-content: start;
   }
-  #sem-header {
-    flex-shrink: 0; display: flex; align-items: center; gap: 10px;
-    font-size: 13px; color: #aaa; padding: 2px 4px;
-  }
-  #sem-label-badge {
-    padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 700;
-    background: rgba(139,92,246,.2); color: #a78bfa;
-  }
-  #sem-grid {
-    flex: 1; display: grid; gap: 8px; overflow: auto; min-height: 0;
-  }
-  .s-cell {
+  /* Cellules du mode doublons / sémantique (scopées pour éviter collision galerie) */
+  #group-grid .g-cell, .s-cell {
     display: flex; flex-direction: column; align-items: center;
-    border: 2px solid #2a2a2a; border-radius: 10px; padding: 6px;
-    cursor: pointer; transition: border-color .15s, background .15s;
+    background: var(--bg-1); border: 2px solid var(--line);
+    border-radius: var(--r-md); padding: 10px;
+    cursor: pointer; transition: border-color var(--dur), background var(--dur), transform .12s var(--ease);
     overflow: hidden; min-height: 0; user-select: none;
   }
-  .s-cell.keep  { border-color: #22c55e; background: rgba(34,197,94,.09); }
-  .s-cell.trash { border-color: #ef4444; background: rgba(239,68,68,.09); }
-  .s-cell:not(.keep):not(.trash):hover { border-color: #7c3aed; background: rgba(139,92,246,.07); }
-  .s-cell-badge {
-    position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
-    font-size: 11px; font-weight: 700; padding: 3px 10px;
-    border-radius: 20px; pointer-events: none; white-space: nowrap;
-  }
-  .s-cell.keep  .s-cell-badge { background: rgba(34,197,94,.9);  color: #fff; }
-  .s-cell.trash .s-cell-badge { background: rgba(239,68,68,.9);  color: #fff; }
-  .s-cell:not(.keep):not(.trash) .s-cell-badge { display: none; }
-  .s-best-badge {
-    font-size: 10px; color: #a78bfa; background: rgba(139,92,246,.15);
-    padding: 2px 6px; border-radius: 8px;
-  }
-  #sem-decision-bar {
-    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-    gap: 12px; font-size: 12px; padding: 4px 0; color: #666;
-  }
-  #sem-counts { font-variant-numeric: tabular-nums; }
-  #btn-sem-validate {
-    background: #7c3aed; color: #fff; min-width: 140px;
-  }
-  #btn-sem-validate:disabled { opacity: .25; }
-  #clip-indicator { font-size: 11px; color: #666; flex-shrink: 0; }
-
-  #group-grid {
-    flex: 1; display: grid; gap: 8px; overflow: auto; min-height: 0;
-  }
-  .g-cell {
-    display: flex; flex-direction: column; align-items: center;
-    border: 2px solid #2a2a2a; border-radius: 10px; padding: 6px;
-    cursor: pointer; transition: border-color .15s, background .15s;
-    overflow: hidden; min-height: 0;
-  }
-  .g-cell:hover { border-color: #22c55e; background: rgba(34,197,94,.07); }
-  .g-cell:hover .g-keep-hint { opacity: 1; }
+  #group-grid .g-cell:hover { border-color: var(--keep-line); background: var(--keep-bg); transform: translateY(-2px); }
+  #group-grid .g-cell:hover .g-keep-hint { opacity: 1; }
+  .s-cell.keep  { border-color: var(--keep-line); background: var(--keep-bg); }
+  .s-cell.trash { border-color: var(--del-line);  background: var(--del-bg); }
+  .s-cell:not(.keep):not(.trash):hover { border-color: var(--violet); background: var(--violet-bg); }
   .g-media-wrap {
     flex: 1; display: flex; align-items: center; justify-content: center;
     overflow: hidden; width: 100%; min-height: 0; position: relative;
   }
-  .g-img {
-    max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px;
-    display: block;
+  .g-img, .g-video {
+    max-width: 100%; max-height: 100%; object-fit: contain; border-radius: var(--r-sm); display: block;
   }
-  .g-video {
-    max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px;
-    display: block; background: #000;
-  }
+  .g-video { background: #000; }
   .g-overlay {
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-    object-fit: contain; pointer-events: none; border-radius: 4px;
+    object-fit: contain; pointer-events: none; border-radius: var(--r-sm);
   }
   .g-meta {
-    flex-shrink: 0; display: flex; gap: 6px; flex-wrap: wrap;
-    justify-content: center; padding: 4px 0 2px; font-size: 10px; color: #666;
+    flex-shrink: 0; display: flex; gap: 6px; flex-wrap: wrap; justify-content: center;
+    padding: 8px 0 2px; font-size: 10.5px; color: var(--txt-3);
   }
-  .g-meta span { background: #1a1a1a; padding: 2px 6px; border-radius: 10px; }
+  .g-meta span { background: var(--bg-2); padding: 2px 7px; border-radius: var(--r-pill); }
   .g-keep-hint {
-    position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
-    background: rgba(34,197,94,.9); color: #fff; font-size: 11px; font-weight: 700;
-    padding: 3px 10px; border-radius: 20px; opacity: 0;
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    background: var(--keep); color: #04130a; font-size: 11px; font-weight: 700;
+    padding: 4px 11px; border-radius: var(--r-pill); opacity: 0;
     transition: opacity .15s; pointer-events: none; white-space: nowrap;
   }
+  .s-cell-badge {
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; font-weight: 700; padding: 4px 11px; border-radius: var(--r-pill);
+    pointer-events: none; white-space: nowrap;
+  }
+  .s-cell.keep  .s-cell-badge { background: var(--keep); color: #04130a; }
+  .s-cell.trash .s-cell-badge { background: var(--del);  color: #fff; }
+  .s-cell:not(.keep):not(.trash) .s-cell-badge { display: none; }
+  .s-best-badge { font-size: 10px; color: var(--violet); background: var(--violet-bg); padding: 2px 7px; border-radius: var(--r-sm); }
+  #sem-label-badge { padding: 4px 12px; border-radius: var(--r-pill); font-size: 12px; font-weight: 700; background: var(--violet-bg); color: var(--violet); }
+  #sem-decision-bar { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--txt-3); }
+  #sem-counts { font-variant-numeric: tabular-nums; }
+  #btn-sem-validate { background: var(--violet); color: #fff; min-width: 140px; }
+  #btn-sem-validate:disabled { opacity: .3; }
 
-  /* ── Contrôles vidéo custom ── */
+  /* ── Contrôles vidéo custom (single) ── */
   #video-ctrl {
-    flex-shrink: 0; display: none; align-items: center; gap: 10px;
-    background: #111; border-top: 1px solid #1c1c1c; padding: 5px 16px; height: 36px;
+    flex-shrink: 0; display: none; align-items: center; gap: 12px;
+    background: var(--bg-1); border-top: 1px solid var(--line); padding: 8px 20px; height: 44px;
   }
   #video-ctrl.on { display: flex; }
-  #vc-pp { background: none; border: none; color: #ccc; font-size: 17px; cursor: pointer; padding: 0; }
-  #vc-prog-wrap {
-    flex: 1; height: 4px; background: #333; border-radius: 2px; cursor: pointer; position: relative;
-  }
-  #vc-prog-fill { height: 100%; background: #aaa; border-radius: 2px; pointer-events: none; width: 0; }
-  #vc-time { font-size: 11px; color: #555; min-width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
-  #vc-mute { background: none; border: none; color: #888; font-size: 15px; cursor: pointer; padding: 0; }
-  #vc-vol  { width: 64px; accent-color: #666; cursor: pointer; }
+  #vc-pp { background: none; border: none; color: var(--txt); font-size: 16px; cursor: pointer; padding: 0; width: 24px; }
+  #vc-prog-wrap { flex: 1; height: 5px; background: var(--bg-3); border-radius: var(--r-pill); cursor: pointer; position: relative; }
+  #vc-prog-fill { height: 100%; background: var(--txt); border-radius: var(--r-pill); pointer-events: none; width: 0; }
+  #vc-time { font-size: 11.5px; color: var(--txt-3); min-width: 74px; text-align: right; font-variant-numeric: tabular-nums; }
+  #vc-mute { background: none; border: none; color: var(--txt-2); font-size: 15px; cursor: pointer; padding: 0; }
+  #vc-vol  { width: 70px; accent-color: var(--txt-2); cursor: pointer; }
 
-  /* ── Trial limit / Paywall ── */
-  #trial-wall {
-    display: none; flex-direction: column; align-items: center;
-    justify-content: center; gap: 18px; padding: 40px; text-align: center;
-  }
-  #trial-wall .tw-icon { font-size: 52px; }
-  #trial-wall h2 { font-size: 22px; font-weight: 700; color: #fff; }
-  #trial-wall p  { color: #666; font-size: 14px; max-width: 420px; line-height: 1.6; }
-  #trial-wall .tw-badge {
-    background: rgba(139,92,246,.15); color: #a78bfa;
-    padding: 4px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
-  }
-  #tw-key-wrap {
-    display: flex; gap: 8px; width: 100%; max-width: 420px;
-  }
-  #tw-key-input {
-    flex: 1; background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
-    color: #fff; font-size: 13px; padding: 10px 14px; outline: none;
-    font-family: monospace; letter-spacing: .05em;
-  }
-  #tw-key-input:focus { border-color: #7c3aed; }
-  #tw-activate {
-    background: #7c3aed; color: #fff; border-radius: 10px;
-    padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
-    border: none; flex-shrink: 0; transition: opacity .15s;
-  }
-  #tw-activate:disabled { opacity: .4; cursor: default; }
-  #tw-error { color: #f87171; font-size: 12px; min-height: 16px; }
-  #tw-benefits {
-    display: flex; flex-direction: column; gap: 6px;
-    font-size: 13px; color: #888; text-align: left; width: 100%; max-width: 420px;
-  }
-  #tw-benefits span { display: flex; align-items: center; gap: 8px; }
-  #tw-benefits span::before { content: "✓"; color: #4ade80; font-weight: 700; }
-
-  /* ── Done screen ── */
-  #done {
-    display: none; flex-direction: column; align-items: center;
-    justify-content: center; gap: 14px;
-  }
-  #done .icon { font-size: 64px; }
-  #done h2    { font-size: 26px; font-weight: 700; }
-  #done p     { color: #666; font-size: 15px; }
-
-  /* ── Barre principale ── */
+  /* ── Barre d'action principale (bas) ── */
   #bar {
-    flex-shrink: 0; background: #161616; border-top: 1px solid #2a2a2a;
-    padding: 9px 18px; display: flex; align-items: center; gap: 11px;
-  }
-  #info { flex: 1; min-width: 0; }
-  #info .name  { font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e5e5e5; }
-  #info .meta  { font-size: 11px; color: #555; margin-top: 2px; }
-
-  #scan-indicator { font-size: 11px; color: #666; flex-shrink: 0; }
-  #scan-indicator.running { color: #60a5fa; }
-  #scan-indicator.done    { color: #4ade80; }
-  #scan-indicator.error   { color: #f87171; }
-
-  button {
-    border: none; border-radius: 10px; padding: 9px 16px;
-    font-size: 12px; font-weight: 600; cursor: pointer;
-    display: flex; flex-direction: column; align-items: center;
-    gap: 2px; transition: opacity .12s, transform .1s; flex-shrink: 0;
-  }
-  button:hover:not(:disabled) { opacity: .85; }
-  button:active:not(:disabled) { transform: scale(.96); }
-  button:disabled { opacity: .25; cursor: default; }
-  .key { font-size: 10px; font-weight: 400; opacity: .5; }
-
-  #btn-back      { background: #2a2a2a; color: #bbb; }
-#btn-overlay   { background: #1e3a5f; color: #7dd3fc; min-width: 98px; }
-  #btn-overlay.off { background: #222; color: #444; }
-  #btn-keep      { background: #16a34a; color: #fff; min-width: 100px; }
-  #btn-trash     { background: #991b1b; color: #fff; min-width: 100px; }
-  #btn-keep-all  { background: #1e3a5f; color: #7dd3fc; }
-  #btn-trash-all { background: #991b1b; color: #fff; }
-  #btn-rescan    { background: none; border: 1px solid #333; color: #666; padding: 4px 8px; font-size: 10px; border-radius: 6px; }
-
-  .flash { animation: flash .18s ease; }
-  @keyframes flash { 0%,100%{opacity:1} 50%{opacity:.35} }
-
-  /* ── Welcome view (v0.2.0) ── */
-  #welcome {
-    position: fixed; inset: 0; z-index: 100; overflow: auto;
-    background: #0a0a0a;
-    display: none;
-    align-items: flex-start; justify-content: center;
-    padding: 40px 20px;
-  }
-  #welcome-card {
-    max-width: 560px; width: 100%;
-    background: #131313; border: 1px solid #232323;
-    border-radius: 12px; padding: 28px;
-  }
-  .wc-title { text-align: center; margin-bottom: 24px; }
-  .wc-title h1 { margin: 6px 0 4px; font-size: 22px; font-weight: 600; }
-  .wc-icon { font-size: 38px; }
-  .wc-tag { color: #888; font-size: 13px; margin: 0; }
-  .wc-section { margin: 20px 0; }
-  .wc-section > label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: #888; margin-bottom: 10px; }
-  #wc-sources { list-style: none; padding: 0; margin: 0 0 10px; }
-  #wc-sources li {
-    display: flex; align-items: center; gap: 8px;
-    background: #1a1a1a; border: 1px solid #232323; border-radius: 6px;
-    padding: 8px 12px; margin-bottom: 6px; font-size: 13px;
-  }
-  #wc-sources .wc-src-name { flex: 1; font-family: -apple-system, system-ui; color: #ddd; }
-  #wc-sources .wc-src-path { font-size: 10px; color: #555; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #wc-sources .wc-src-rm {
-    background: transparent; border: 0; color: #f87171;
-    cursor: pointer; padding: 4px 8px; border-radius: 4px;
-    font-size: 16px; line-height: 1;
-  }
-  #wc-sources .wc-src-rm:hover { background: rgba(239,68,68,.12); }
-  #wc-add {
-    width: 100%; background: #1a1a1a; border: 1px dashed #2a2a2a;
-    color: #aaa; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
-    transition: all .15s;
-  }
-  #wc-add:hover { background: #222; color: #ddd; border-color: #444; }
-  #wc-path-fallback {
-    width: 100%; box-sizing: border-box; margin-top: 8px;
-    background: #1a1a1a; border: 1px solid #2a2a2a; color: #ddd;
-    padding: 10px; border-radius: 6px; font-size: 12px;
-    font-family: ui-monospace, monospace;
-  }
-  .wc-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
-  .wc-opts label {
-    display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ccc;
-    background: #1a1a1a; border: 1px solid #232323; padding: 10px;
-    border-radius: 6px; cursor: pointer; transition: border-color .15s;
-  }
-  .wc-opts label:hover { border-color: #333; }
-  .wc-opts input[type=checkbox] { accent-color: #a78bfa; margin: 0; }
-  .wc-preview {
-    background: #0d0d0d; border: 1px solid #1d1d1d; border-radius: 6px;
-    padding: 12px; font-size: 11px; color: #777; display: flex;
-    flex-direction: column; gap: 4px;
-  }
-  .wc-preview code { color: #a78bfa; font-family: ui-monospace, monospace; font-size: 11px; word-break: break-all; }
-  #wc-start {
-    width: 100%; padding: 14px; background: #16a34a; color: #fff;
-    border: 0; border-radius: 8px; font-size: 15px; font-weight: 600;
-    cursor: pointer; margin-top: 12px; transition: background .15s;
-  }
-  #wc-start:disabled { background: #1f2937; color: #555; cursor: not-allowed; }
-  #wc-start:not(:disabled):hover { background: #15803d; }
-  .wc-err { color: #f87171; font-size: 12px; margin: 8px 0 0; text-align: center; min-height: 18px; }
-  #wc-source-err { color: #f87171; font-size: 11px; margin-top: 6px; min-height: 14px; }
-
-  .wc-hint { font-size: 11px; color: #888; margin: 0 0 10px; line-height: 1.5; }
-  .wc-presets { display: flex; flex-direction: column; gap: 6px; }
-  .wc-preset {
-    display: grid; grid-template-columns: auto 1fr; column-gap: 10px;
-    align-items: center;
-    background: #1a1a1a; border: 1px solid #232323; padding: 10px 12px;
-    border-radius: 6px; cursor: pointer; transition: all .15s;
-  }
-  .wc-preset:hover { border-color: #333; background: #1f1f1f; }
-  .wc-preset input { accent-color: #fb923c; margin: 0; grid-row: 1 / 3; }
-  .wc-preset .wc-pres-name { font-size: 13px; color: #ddd; font-weight: 500; }
-  .wc-preset .wc-pres-desc { font-size: 11px; color: #777; grid-column: 2; }
-  .wc-preset:has(input:checked) { border-color: #fb923c; background: rgba(251,146,60,.08); }
-  .wc-convert-info {
-    margin-top: 10px; font-size: 12px; color: #888;
+    flex-shrink: 0; background: rgba(16,16,18,.82); backdrop-filter: saturate(180%) blur(20px);
+    border-top: 1px solid var(--line); padding: 14px 18px;
     display: flex; align-items: center; gap: 10px;
   }
-  .wc-convert-info button {
-    background: rgba(251,146,60,.15); border: 1px solid rgba(251,146,60,.4); color: #fb923c;
-    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
-  }
-  .wc-convert-info button:hover { background: rgba(251,146,60,.25); }
-  .wc-convert-info button:disabled { background: #1a1a1a; color: #555; border-color: #2a2a2a; cursor: not-allowed; }
+  #bar .bar-spacer { flex: 1; }
+  #bar .bar-tools  { display: flex; align-items: center; gap: 8px; }
 
-  /* Mises à jour (welcome view) */
-  .wc-update-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: #ccc; }
-  .wc-update-current b { color: #ddd; font-weight: 600; }
-  .wc-update-btn {
-    background: #1a1a1a; border: 1px solid #333; color: #ccc;
-    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  /* Actions primaires garder / supprimer : grandes, claires, rassurantes */
+  #btn-keep, #btn-trash {
+    min-width: 150px; padding: 13px 22px; font-size: 14px; font-weight: 700;
+    border-radius: var(--r-md); gap: 9px;
   }
-  .wc-update-btn:hover { border-color: #555; background: #222; }
-  .wc-update-btn:disabled { color: #555; cursor: not-allowed; }
-  .wc-update-banner {
-    margin-top: 12px; padding: 12px 14px; border-radius: 8px;
-    background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35);
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  #btn-keep  { background: var(--keep); color: #04130a; }
+  #btn-keep:hover:not(:disabled)  { background: #28c14e; }
+  #btn-trash { background: var(--del); color: #fff; }
+  #btn-trash:hover:not(:disabled) { background: #f5392d; }
+  #btn-keep .key  { background: rgba(0,0,0,.16); opacity: .9; }
+  #btn-trash .key { background: rgba(0,0,0,.22); color: #fff; opacity: .9; }
+
+  /* Undo : présent et lisible, jamais agressif */
+  #btn-back {
+    background: var(--bg-2); color: var(--txt); border: 1px solid var(--line);
+    border-radius: var(--r-md); padding: 11px 16px; font-weight: 600;
   }
+  #btn-back:hover:not(:disabled) { background: var(--bg-3); border-color: var(--line-2); }
+
+  /* Outils média (rotation, rogner, overlay) : ghost discrets */
+  #btn-rotate, #btn-crop, #btn-overlay {
+    background: transparent; border: 1px solid var(--line); color: var(--txt-2);
+    border-radius: var(--r-sm); padding: 10px 13px; font-weight: 500; font-size: 12.5px;
+  }
+  #btn-rotate:hover, #btn-crop:hover, #btn-overlay:hover { background: var(--bg-2); color: var(--txt); border-color: var(--line-2); }
+  #btn-overlay { color: var(--blue); border-color: var(--blue-bg); }
+  #btn-overlay.off { color: var(--txt-4); border-color: var(--line); }
+
+  /* Actions de groupe */
+  #btn-keep-all  { background: var(--keep); color: #04130a; min-width: 150px; padding: 13px 22px; font-size: 14px; font-weight: 700; border-radius: var(--r-md); }
+  #btn-keep-all:hover { background: #28c14e; }
+  #btn-trash-all { background: var(--del); color: #fff; min-width: 150px; padding: 13px 22px; font-size: 14px; font-weight: 700; border-radius: var(--r-md); }
+  #btn-trash-all:hover { background: #f5392d; }
+  #btn-sem-validate.in-bar { background: var(--violet); color: #fff; min-width: 150px; padding: 13px 22px; font-size: 14px; border-radius: var(--r-md); }
+
+  /* Utilitaires topbar : accueil, vider, scan, gallery toggle */
+  #btn-reset, #btn-empty-trash, #btn-gallery {
+    background: transparent; border: 1px solid var(--line); color: var(--txt-2);
+    padding: 7px 12px; border-radius: var(--r-sm); font-size: 12.5px; font-weight: 500;
+  }
+  #btn-reset:hover, #btn-empty-trash:hover, #btn-gallery:hover { background: var(--bg-2); color: var(--txt); border-color: var(--line-2); }
+  #btn-empty-trash[data-active="1"] { color: var(--amber); border-color: var(--amber-bg); }
+  #btn-empty-trash[data-active="1"]:hover { background: var(--amber-bg); color: var(--amber); }
+  #empty-trash-label { font-weight: 600; }
+  #scan-indicator { font-size: 11.5px; color: var(--txt-3); }
+  #scan-indicator.running { color: var(--blue); }
+  #scan-indicator.done    { color: var(--keep); }
+  #scan-indicator.error   { color: var(--del); }
+  #btn-rescan { background: none; border: 1px solid var(--line); color: var(--txt-3); padding: 5px 9px; font-size: 11px; border-radius: var(--r-sm); }
+  #btn-rescan:hover { color: var(--txt); border-color: var(--line-2); }
+
+  .flash { animation: flash .2s var(--ease); }
+  @keyframes flash { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* ── Segmented control (filtre Tout / Photos / Vidéos) ── */
+  .tf-group {
+    display: inline-flex; background: var(--bg-2); border: 1px solid var(--line);
+    border-radius: var(--r-sm); padding: 2px; gap: 2px;
+  }
+  .tf-btn {
+    background: transparent; border: none; color: var(--txt-3); cursor: pointer;
+    padding: 5px 12px; font-size: 12px; font-weight: 600; border-radius: 6px;
+    transition: background .16s var(--ease), color .16s;
+  }
+  .tf-btn:hover { color: var(--txt); }
+  .tf-btn.active { background: var(--bg-3); color: var(--txt); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+
+  /* ── Écran de bienvenue / configuration ── */
+  #welcome {
+    position: fixed; inset: 0; z-index: 100; overflow: auto;
+    background: radial-gradient(120% 80% at 50% -10%, #16161a 0%, var(--bg) 55%);
+    display: none; align-items: flex-start; justify-content: center; padding: 48px 20px;
+  }
+  #welcome-card {
+    max-width: 580px; width: 100%; background: var(--bg-1); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 32px; box-shadow: var(--shadow);
+  }
+  .wc-title { text-align: center; margin-bottom: 28px; }
+  .wc-title h1 { margin: 10px 0 5px; font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+  .wc-icon { font-size: 42px; }
+  .wc-tag { color: var(--txt-3); font-size: 14px; margin: 0; }
+  .wc-section { margin: 24px 0; }
+  .wc-section > label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--txt-3); margin-bottom: 12px; font-weight: 600; }
+  #wc-sources { list-style: none; padding: 0; margin: 0 0 10px; }
+  #wc-sources li {
+    display: flex; align-items: center; gap: 10px; background: var(--bg-2);
+    border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 14px; margin-bottom: 7px; font-size: 13px;
+  }
+  #wc-sources .wc-src-name { flex: 1; color: var(--txt); font-weight: 500; }
+  #wc-sources .wc-src-path { font-size: 10.5px; color: var(--txt-4); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #wc-sources .wc-src-rm { background: transparent; border: 0; color: var(--del); cursor: pointer; padding: 4px 8px; border-radius: 6px; font-size: 16px; line-height: 1; }
+  #wc-sources .wc-src-rm:hover { background: var(--del-bg); }
+  #wc-add {
+    width: 100%; background: var(--bg-2); border: 1px dashed var(--line-2);
+    color: var(--txt-2); padding: 12px; border-radius: var(--r-sm); cursor: pointer; font-size: 13px; font-weight: 500;
+  }
+  #wc-add:hover { background: var(--bg-3); color: var(--txt); border-color: var(--blue); }
+  #wc-path-fallback {
+    width: 100%; margin-top: 8px; background: var(--bg-2); border: 1px solid var(--line);
+    color: var(--txt); padding: 11px; border-radius: var(--r-sm); font-size: 12px; font-family: ui-monospace, monospace;
+  }
+  .wc-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+  .wc-opts label {
+    display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--txt-2);
+    background: var(--bg-2); border: 1px solid var(--line); padding: 11px; border-radius: var(--r-sm);
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .wc-opts label:hover { border-color: var(--line-2); color: var(--txt); }
+  .wc-opts input[type=checkbox] { accent-color: var(--blue); margin: 0; width: 16px; height: 16px; }
+  .wc-preview { background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 14px; font-size: 11.5px; color: var(--txt-3); display: flex; flex-direction: column; gap: 5px; }
+  .wc-preview code { color: var(--blue); font-family: ui-monospace, monospace; font-size: 11.5px; word-break: break-all; }
+  #wc-start {
+    width: 100%; padding: 15px; background: var(--keep); color: #04130a;
+    border: 0; border-radius: var(--r-md); font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 14px;
+    transition: background .15s, transform .08s;
+  }
+  #wc-start:disabled { background: var(--bg-3); color: var(--txt-4); cursor: not-allowed; }
+  #wc-start:not(:disabled):hover { background: #28c14e; }
+  #wc-start:not(:disabled):active { transform: scale(.99); }
+  #wc-gallery-btn { width: 100%; margin-top: 8px; background: var(--bg-2); color: var(--txt); border: 1px solid var(--line); padding: 12px; border-radius: var(--r-md); font-weight: 600; }
+  #wc-gallery-btn:not(:disabled):hover { background: var(--bg-3); }
+  .wc-err { color: var(--del); font-size: 12px; margin: 8px 0 0; text-align: center; min-height: 18px; }
+  #wc-source-err { color: var(--del); font-size: 11.5px; margin-top: 6px; min-height: 14px; }
+  .wc-hint { font-size: 11.5px; color: var(--txt-3); margin: 0 0 10px; line-height: 1.5; }
+  .wc-presets { display: flex; flex-direction: column; gap: 7px; }
+  .wc-preset {
+    display: grid; grid-template-columns: auto 1fr; column-gap: 12px; align-items: center;
+    background: var(--bg-2); border: 1px solid var(--line); padding: 11px 13px; border-radius: var(--r-sm);
+    cursor: pointer; transition: all .15s;
+  }
+  .wc-preset:hover { border-color: var(--line-2); background: var(--bg-3); }
+  .wc-preset input { accent-color: var(--amber); margin: 0; grid-row: 1 / 3; }
+  .wc-preset .wc-pres-name { font-size: 13px; color: var(--txt); font-weight: 600; }
+  .wc-preset .wc-pres-desc { font-size: 11px; color: var(--txt-3); grid-column: 2; }
+  .wc-preset:has(input:checked) { border-color: var(--amber); background: var(--amber-bg); }
+  .wc-convert-info { margin-top: 10px; font-size: 12px; color: var(--txt-3); display: flex; align-items: center; gap: 10px; }
+  .wc-convert-info button { background: var(--amber-bg); border: 1px solid rgba(255,159,10,.4); color: var(--amber); padding: 9px 15px; border-radius: var(--r-sm); cursor: pointer; font-size: 12px; font-weight: 600; }
+  .wc-convert-info button:hover { background: rgba(255,159,10,.25); }
+  .wc-convert-info button:disabled { background: var(--bg-2); color: var(--txt-4); border-color: var(--line); cursor: not-allowed; }
+
+  /* Mises à jour (welcome) */
+  .wc-update-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--txt-2); }
+  .wc-update-current b { color: var(--txt); font-weight: 600; }
+  .wc-update-btn { background: var(--bg-2); border: 1px solid var(--line); color: var(--txt-2); padding: 7px 13px; border-radius: var(--r-sm); cursor: pointer; font-size: 12px; }
+  .wc-update-btn:hover { border-color: var(--line-2); background: var(--bg-3); color: var(--txt); }
+  .wc-update-btn:disabled { color: var(--txt-4); cursor: not-allowed; }
+  .wc-update-banner { margin-top: 12px; padding: 14px; border-radius: var(--r-md); background: var(--violet-bg); border: 1px solid rgba(191,90,242,.35); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .wc-update-banner-text { display: flex; align-items: center; gap: 12px; }
   .wc-update-emoji { font-size: 22px; }
-  .wc-update-banner-text b { color: #e9e2ff; font-size: 13px; }
-  .wc-update-btn-primary {
-    background: rgba(167,139,250,.18); border: 1px solid rgba(167,139,250,.5); color: #c4b5fd;
-    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
-    white-space: nowrap;
-  }
-  .wc-update-btn-primary:hover { background: rgba(167,139,250,.3); }
+  .wc-update-banner-text b { color: #e9d5ff; font-size: 13px; }
+  .wc-update-btn-primary { background: var(--violet); border: 0; color: #fff; padding: 9px 15px; border-radius: var(--r-sm); cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
+  .wc-update-btn-primary:hover { background: #ad4ce0; }
   .wc-update-btn-primary:disabled { opacity: .5; cursor: not-allowed; }
 
-  #cvm-bar-wrap {
-    background: #0a0a0a; border-radius: 4px; height: 8px; overflow: hidden; margin: 14px 0 10px;
-  }
-  #cvm-bar {
-    height: 100%; width: 0%; background: linear-gradient(90deg, #fb923c, #f59e0b);
-    transition: width .3s ease;
-  }
-  #cvm-stats {
-    display: flex; justify-content: space-between; font-size: 12px; color: #aaa;
-    margin: 4px 0;
-  }
-  #cvm-stats b { color: #fff; }
-  #cvm-summary {
-    background: #0d0d0d; border: 1px solid #1d1d1d; border-radius: 6px;
-    padding: 12px; margin-top: 14px; font-size: 12px; color: #aaa; line-height: 1.6;
-  }
-  #cvm-summary b { color: #4ade80; }
+  /* ── Barres de progression (conversion / update) ── */
+  #cvm-bar-wrap { background: var(--bg); border-radius: var(--r-pill); height: 8px; overflow: hidden; margin: 16px 0 10px; }
+  #cvm-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), #ffb340); transition: width .3s var(--ease); }
+  #cvm-stats { display: flex; justify-content: space-between; font-size: 12px; color: var(--txt-2); margin: 4px 0; font-variant-numeric: tabular-nums; }
+  #cvm-stats b { color: var(--txt); }
+  #cvm-summary { background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 14px; margin-top: 14px; font-size: 12px; color: var(--txt-2); line-height: 1.6; }
+  #cvm-summary b { color: var(--keep); }
 
-  #btn-reset, #btn-rotate, #btn-crop, #btn-empty-trash {
-    background: transparent; border: 1px solid #2a2a2a; color: #888;
-    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
-  }
-  #btn-reset:hover, #btn-rotate:hover, #btn-crop:hover, #btn-empty-trash:hover {
-    background: #1a1a1a; color: #ddd; border-color: #444;
-  }
-  #btn-empty-trash[data-active="1"] {
-    color: #fb923c; border-color: rgba(251,146,60,.4);
-  }
-  #btn-empty-trash[data-active="1"]:hover {
-    background: rgba(251,146,60,.12); color: #fdba74;
-  }
-  #empty-trash-label {
-    font-weight: 600;
-  }
+  /* ── Trial / Paywall ── */
+  #trial-wall { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 48px; text-align: center; }
+  #trial-wall .tw-icon { font-size: 56px; }
+  #trial-wall h2 { font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
+  #trial-wall p  { color: var(--txt-3); font-size: 14px; max-width: 440px; line-height: 1.6; }
+  #trial-wall .tw-badge { background: var(--violet-bg); color: var(--violet); padding: 5px 15px; border-radius: var(--r-pill); font-size: 12px; font-weight: 600; }
+  #tw-key-wrap { display: flex; gap: 8px; width: 100%; max-width: 440px; }
+  #tw-key-input { flex: 1; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm); color: var(--txt); font-size: 13px; padding: 11px 15px; outline: none; font-family: ui-monospace, monospace; letter-spacing: .08em; }
+  #tw-key-input:focus { border-color: var(--violet); }
+  #tw-activate { background: var(--violet); color: #fff; border-radius: var(--r-sm); padding: 11px 20px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; flex-shrink: 0; }
+  #tw-activate:disabled { opacity: .4; cursor: default; }
+  #tw-error { color: var(--del); font-size: 12px; min-height: 16px; }
+  #tw-benefits { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--txt-2); text-align: left; width: 100%; max-width: 440px; }
+  #tw-benefits span { display: flex; align-items: center; gap: 10px; }
+  #tw-benefits span::before { content: "✓"; color: var(--keep); font-weight: 700; }
 
-  /* ── Modal générique ── */
-  .modal-back {
-    position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.7);
-    display: none; align-items: center; justify-content: center;
-    backdrop-filter: blur(4px);
+  /* ── Écran « tri terminé » ── */
+  #done { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 40px; text-align: center; }
+  #done .icon { font-size: 60px; margin-bottom: 8px; }
+  #done h2 { font-size: 28px; font-weight: 700; letter-spacing: -.02em; }
+  #done p { color: var(--txt-3); font-size: 15px; }
+  #done-sub { color: var(--txt-4); font-size: 13px; margin-top: 2px; }
+  #done-actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 26px; max-width: 540px; }
+  .done-cta {
+    background: var(--bg-1); border: 1px solid var(--line); color: var(--txt);
+    padding: 11px 18px; border-radius: var(--r-md); cursor: pointer; font-size: 13px; font-weight: 600;
+    transition: background .15s, border-color .15s, transform .08s;
   }
+  .done-cta:hover { background: var(--bg-2); border-color: var(--line-2); }
+  .done-cta:active { transform: scale(.98); }
+  .done-cta.primary { background: var(--keep-bg); border-color: var(--keep-line); color: var(--keep); }
+  .done-cta.primary:hover { background: rgba(48,209,88,.26); }
+
+  /* ── Overlay de traitement (progression réelle) ── */
+  #processing-overlay {
+    position: fixed; inset: 0; z-index: 400; display: none; flex-direction: column;
+    align-items: center; justify-content: center; gap: 20px; text-align: center;
+    background: rgba(8,8,9,.9); backdrop-filter: blur(14px);
+  }
+  #processing-overlay.show { display: flex; }
+  #proc-spinner { width: 48px; height: 48px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--amber); animation: proc-spin .9s linear infinite; }
+  @keyframes proc-spin { to { transform: rotate(360deg); } }
+  #proc-title { font-size: 17px; font-weight: 700; color: var(--txt); }
+  #proc-warn  { font-size: 13px; color: var(--amber); max-width: 380px; line-height: 1.5; }
+  #proc-bar-wrap { width: 340px; height: 8px; background: var(--bg); border-radius: var(--r-pill); overflow: hidden; }
+  #proc-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), #ffb340); transition: width .3s var(--ease); }
+  #proc-meta { font-size: 12.5px; color: var(--txt-2); font-variant-numeric: tabular-nums; }
+  #proc-bar-wrap.indeterminate #proc-bar { width: 35%; animation: proc-indet 1.1s ease-in-out infinite; }
+  @keyframes proc-indet { 0%{transform:translateX(-120%)} 100%{transform:translateX(300%)} }
+  #proc-error { font-size: 13px; color: var(--del); max-width: 400px; display: none; }
+  #proc-close { display: none; background: var(--bg-2); border: 1px solid var(--line); color: var(--txt); padding: 10px 20px; border-radius: var(--r-sm); cursor: pointer; font-size: 13px; }
+
+  /* ── Mode galerie de tri ── */
+  #gallery-stage { display: none; flex-direction: column; flex: 1; min-height: 0; }
+  #gallery-stage.show { display: flex; }
+  #gallery-top {
+    display: flex; align-items: center; gap: 14px; padding: 14px 20px;
+    background: rgba(16,16,18,.72); backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--line); flex-shrink: 0; flex-wrap: wrap;
+  }
+  #gallery-top h2 { font-size: 15px; font-weight: 700; color: var(--txt); margin: 0; letter-spacing: -.01em; }
+  #gallery-count { font-size: 12.5px; color: var(--txt-3); font-variant-numeric: tabular-nums; }
+  #gallery-grid {
+    flex: 1; min-height: 0; overflow-y: auto; padding: 20px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; align-content: start;
+  }
+  #gallery-grid .g-cell {
+    position: relative; background: var(--bg-1); border: 2px solid var(--line);
+    border-radius: var(--r-md); overflow: hidden; cursor: pointer;
+    transition: border-color .14s var(--ease), transform .14s var(--ease), box-shadow .14s;
+    display: block;
+  }
+  #gallery-grid .g-cell:hover { transform: translateY(-2px); box-shadow: var(--shadow-sm); border-color: var(--line-2); }
+  #gallery-grid .g-cell:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-bg); }
+  #gallery-grid .g-cell.keep  { border-color: var(--keep); }
+  #gallery-grid .g-cell.trash { border-color: var(--del); opacity: .65; }
+  .g-thumb { aspect-ratio: 1; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .g-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .g-info { padding: 8px 10px 2px; font-size: 11.5px; color: var(--txt-2); display: flex; justify-content: space-between; gap: 6px; font-variant-numeric: tabular-nums; }
+  .g-name { padding: 0 10px 9px; font-size: 10.5px; color: var(--txt-4); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .g-mark {
+    position: absolute; top: 8px; right: 8px; width: 26px; height: 26px; border-radius: 50%;
+    display: none; align-items: center; justify-content: center; font-size: 13px; color: #fff; font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  #gallery-grid .g-cell.keep  .g-mark { display: flex; background: var(--keep); color: #04130a; }
+  #gallery-grid .g-cell.trash .g-mark { display: flex; background: var(--del); }
+  #gallery-foot {
+    display: flex; align-items: center; gap: 16px; padding: 14px 20px;
+    background: rgba(16,16,18,.82); backdrop-filter: saturate(180%) blur(20px);
+    border-top: 1px solid var(--line); flex-shrink: 0; flex-wrap: wrap;
+  }
+  #gallery-hint { font-size: 12px; color: var(--txt-3); flex: 1; line-height: 1.8; }
+  #gallery-hint .key { background: var(--bg-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; font-size: 11px; color: var(--txt-2); margin: 0 1px; }
+  #gallery-marks { font-size: 12.5px; color: var(--txt-2); font-variant-numeric: tabular-nums; }
+  #gallery-validate { background: var(--keep); color: #04130a; padding: 11px 20px; border-radius: var(--r-md); cursor: pointer; font-size: 13px; font-weight: 700; }
+  #gallery-validate:disabled { background: var(--bg-3); color: var(--txt-4); cursor: not-allowed; }
+  #gallery-validate:not(:disabled):hover { background: #28c14e; }
+  #btn-gallery-exit { background: var(--bg-2); border: 1px solid var(--line); color: var(--txt); padding: 8px 14px; border-radius: var(--r-sm); font-weight: 600; }
+  #btn-gallery-exit:hover { background: var(--bg-3); border-color: var(--line-2); }
+
+  /* ── Modales génériques ── */
+  .modal-back { position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; backdrop-filter: blur(8px); }
   .modal-back.show { display: flex; }
-  .modal-card {
-    background: #141414; border: 1px solid #232323; border-radius: 12px;
-    padding: 24px; max-width: 480px; width: 90%;
-  }
-  .modal-card h3 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
-  .modal-card p { color: #999; font-size: 13px; line-height: 1.5; margin: 8px 0; }
-  .modal-actions {
-    display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px;
-  }
-  .modal-actions button {
-    padding: 8px 16px; border: 0; border-radius: 6px; font-size: 13px;
-    cursor: pointer; font-weight: 500;
-  }
-  .modal-btn-cancel { background: #1f1f1f; color: #aaa; }
-  .modal-btn-cancel:hover { background: #2a2a2a; color: #ddd; }
-  .modal-btn-confirm { background: #f59e0b; color: #fff; }
-  .modal-btn-confirm:hover { background: #d97706; }
-  .modal-btn-danger { background: #dc2626; color: #fff; }
-  .modal-btn-danger:hover { background: #b91c1c; }
+  .modal-card { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 26px; max-width: 480px; width: 90%; box-shadow: var(--shadow); }
+  .modal-card h3 { margin: 0 0 8px; font-size: 17px; font-weight: 700; letter-spacing: -.01em; }
+  .modal-card p { color: var(--txt-2); font-size: 13px; line-height: 1.5; margin: 8px 0; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+  .modal-actions button { padding: 9px 18px; border: 0; border-radius: var(--r-sm); font-size: 13px; cursor: pointer; font-weight: 600; }
+  .modal-btn-cancel { background: var(--bg-2); color: var(--txt-2); }
+  .modal-btn-cancel:hover { background: var(--bg-3); color: var(--txt); }
+  .modal-btn-confirm { background: var(--amber); color: #1a1200; }
+  .modal-btn-confirm:hover { background: #ffb340; }
+  .modal-btn-danger { background: var(--del); color: #fff; }
+  .modal-btn-danger:hover { background: #f5392d; }
 
   /* ── Crop overlay (image) ── */
-  #crop-overlay {
-    position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.85);
-    display: none; align-items: center; justify-content: center; flex-direction: column;
-  }
+  #crop-overlay { position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.88); display: none; align-items: center; justify-content: center; flex-direction: column; }
   #crop-overlay.show { display: flex; }
-  #crop-stage {
-    position: relative; max-width: 90vw; max-height: 78vh;
-    overflow: hidden; cursor: crosshair;
-    background: #0a0a0a;
-  }
+  #crop-stage { position: relative; max-width: 90vw; max-height: 78vh; overflow: hidden; cursor: crosshair; background: var(--bg); border-radius: var(--r-md); }
   #crop-img { display: block; max-width: 90vw; max-height: 78vh; user-select: none; -webkit-user-drag: none; }
-  #crop-rect {
-    position: absolute; border: 2px dashed #fff;
-    background: rgba(167,139,250,.18);
-    box-shadow: 0 0 0 99999px rgba(0,0,0,.55);
-    display: none;
-  }
-  #crop-bar {
-    display: flex; align-items: center; gap: 12px; margin-top: 18px;
-    color: #ccc; font-size: 13px;
-  }
-  #crop-info { font-family: ui-monospace, monospace; color: #888; }
-  #crop-bar button {
-    padding: 10px 20px; border: 0; border-radius: 6px; cursor: pointer;
-    font-size: 13px; font-weight: 600;
-  }
-  .crop-btn-cancel { background: #1f1f1f; color: #aaa; }
-  .crop-btn-cancel:hover { background: #2a2a2a; color: #ddd; }
-  .crop-btn-validate { background: #16a34a; color: #fff; }
-  .crop-btn-validate:hover { background: #15803d; }
-  .crop-btn-validate:disabled { background: #1f2937; color: #555; cursor: not-allowed; }
+  #crop-rect { position: absolute; border: 2px solid #fff; background: rgba(10,132,255,.16); box-shadow: 0 0 0 99999px rgba(0,0,0,.6); display: none; }
+  #crop-bar { display: flex; align-items: center; gap: 14px; margin-top: 20px; color: var(--txt-2); font-size: 13px; }
+  #crop-info { font-family: ui-monospace, monospace; color: var(--txt-3); }
+  #crop-bar button { padding: 11px 22px; border: 0; border-radius: var(--r-sm); cursor: pointer; font-size: 13px; font-weight: 600; }
+  .crop-btn-cancel { background: var(--bg-2); color: var(--txt-2); }
+  .crop-btn-cancel:hover { background: var(--bg-3); color: var(--txt); }
+  .crop-btn-validate { background: var(--keep); color: #04130a; }
+  .crop-btn-validate:hover { background: #28c14e; }
+  .crop-btn-validate:disabled { background: var(--bg-3); color: var(--txt-4); cursor: not-allowed; }
 
-  /* ── Trim overlay (video) ── */
-  #trim-overlay {
-    position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.9);
-    display: none; align-items: center; justify-content: center; flex-direction: column;
-    padding: 30px;
-  }
+  /* ── Trim overlay (vidéo) ── */
+  #trim-overlay { position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.92); display: none; align-items: center; justify-content: center; flex-direction: column; padding: 32px; }
   #trim-overlay.show { display: flex; }
-  #trim-video { max-width: 80vw; max-height: 60vh; border-radius: 6px; background: #000; }
-  #trim-timeline-wrap {
-    width: min(80vw, 800px); margin-top: 24px;
-    background: #1a1a1a; border-radius: 8px; padding: 16px;
-  }
-  #trim-track {
-    position: relative; height: 36px; background: #0a0a0a;
-    border-radius: 4px; cursor: pointer; margin-bottom: 12px;
-  }
-  #trim-selection {
-    position: absolute; top: 0; bottom: 0;
-    background: rgba(167,139,250,.25);
-    border-left: 3px solid #a78bfa; border-right: 3px solid #a78bfa;
-  }
-  .trim-handle {
-    position: absolute; top: -4px; bottom: -4px; width: 14px;
-    background: #a78bfa; border-radius: 3px; cursor: ew-resize;
-    transform: translateX(-7px);
-    display: flex; align-items: center; justify-content: center;
-    color: #1a1a1a; font-size: 10px; font-weight: bold;
-  }
+  #trim-video { max-width: 80vw; max-height: 58vh; border-radius: var(--r-md); background: #000; box-shadow: var(--shadow); }
+  #trim-timeline-wrap { width: min(80vw, 820px); margin-top: 26px; background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md); padding: 18px; }
+  #trim-track { position: relative; height: 40px; background: var(--bg); border-radius: var(--r-sm); cursor: pointer; margin-bottom: 14px; }
+  #trim-selection { position: absolute; top: 0; bottom: 0; background: var(--blue-bg); border-left: 3px solid var(--blue); border-right: 3px solid var(--blue); }
+  .trim-handle { position: absolute; top: -4px; bottom: -4px; width: 16px; background: var(--blue); border-radius: 4px; cursor: ew-resize; transform: translateX(-8px); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 11px; font-weight: bold; }
   #trim-handle-start { left: 0; }
   #trim-handle-end   { left: 100%; }
-  #trim-times {
-    display: flex; justify-content: space-between; font-size: 12px;
-    font-family: ui-monospace, monospace; color: #888;
-  }
-  #trim-times span b { color: #a78bfa; }
-  #trim-actions {
-    display: flex; gap: 8px; justify-content: center; margin-top: 16px;
-  }
-  #trim-actions button {
-    padding: 10px 20px; border: 0; border-radius: 6px; cursor: pointer;
-    font-size: 13px; font-weight: 600;
-  }
+  #trim-times { display: flex; justify-content: space-between; font-size: 12px; font-family: ui-monospace, monospace; color: var(--txt-3); }
+  #trim-times span b { color: var(--blue); }
+  #trim-actions { display: flex; gap: 8px; justify-content: center; margin-top: 18px; }
+  #trim-actions button { padding: 11px 22px; border: 0; border-radius: var(--r-sm); cursor: pointer; font-size: 13px; font-weight: 600; }
 
-  /* ── Toast notifications ── */
+  /* ── Toast ── */
   #toast {
-    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
-    background: #1a1a1a; color: #fff; padding: 12px 20px;
-    border: 1px solid #333; border-radius: 8px; font-size: 13px;
-    z-index: 300; opacity: 0; transition: opacity .2s ease;
-    pointer-events: none; max-width: 80vw; text-align: center;
+    position: fixed; bottom: 96px; left: 50%; transform: translateX(-50%) translateY(8px);
+    background: rgba(40,40,44,.92); backdrop-filter: blur(20px); color: var(--txt);
+    padding: 13px 22px; border: 1px solid var(--line-2); border-radius: var(--r-md);
+    font-size: 13px; font-weight: 500; z-index: 300; opacity: 0;
+    transition: opacity .22s var(--ease), transform .22s var(--ease);
+    pointer-events: none; max-width: 80vw; text-align: center; box-shadow: var(--shadow-sm);
   }
-  #toast.show { opacity: 1; }
-  #toast.error { background: #7f1d1d; border-color: #991b1b; }
-  #toast.success { background: #14532d; border-color: #166534; }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.error   { background: rgba(120,30,28,.94); border-color: var(--del-line); }
+  #toast.success { background: rgba(20,70,38,.94); border-color: var(--keep-line); }
 
-  /* v0.2.0 : CLIP/IA caché */
+  /* CLIP/IA masqué (v0.2.0) */
   #clip-indicator { display: none !important; }
   #sem-stage      { display: none !important; }
 </style>
@@ -3037,6 +3360,28 @@ PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="progress-wrap"><div id="progress-bar"></div></div>
+
+<!-- Topbar : contexte du média (nom, position) + utilitaires -->
+<div id="topbar">
+  <div class="tb-left">
+    <div id="info">
+      <div class="name" id="fname">Chargement…</div>
+      <div class="meta" id="fmeta"></div>
+    </div>
+  </div>
+  <div class="tb-right">
+    <div id="triage-filter" class="tf-group" title="Filtrer les médias à trier"></div>
+    <button id="btn-gallery" onclick="setTriageMode('gallery')" title="Basculer en mode galerie (tri par lot au clavier)">▦ Galerie</button>
+    <button id="btn-empty-trash" onclick="confirmEmptyTrash()" title="Vider Tri/Supprimées vers la Corbeille macOS">🗑 <span id="empty-trash-label">Vider</span></button>
+    <span id="scan-indicator">
+      <button id="btn-rescan" onclick="triggerRescan()" title="Relancer l'analyse des doublons pHash">↻</button>
+    </span>
+    <span id="clip-indicator">
+      <button id="btn-clip-rescan" onclick="triggerClipRescan()" title="Lancer l'analyse IA (CLIP ViT-L/14)">🤖</button>
+    </span>
+    <button id="btn-reset" onclick="wcReset()" title="Revenir à l'accueil (dossiers et options)">⚙ Accueil</button>
+  </div>
+</div>
 
 <!-- Welcome view (v0.2.0) -->
 <div id="welcome">
@@ -3194,9 +3539,17 @@ PAGE = r"""<!DOCTYPE html>
     </p>
   </div>
   <div id="done">
-    <div class="icon">✅</div>
-    <h2>Tri terminé !</h2>
+    <div class="icon" id="done-icon">✅</div>
+    <h2 id="done-title">Tri terminé !</h2>
     <p id="done-msg"></p>
+    <p id="done-sub"></p>
+    <div id="done-actions">
+      <button class="done-cta primary" onclick="doRefreshQueue()">↻ Rechercher de nouveaux médias</button>
+      <button class="done-cta" id="done-allfilter" onclick="setTriageFilter('all')" style="display:none">👁 Voir tout</button>
+      <button class="done-cta" onclick="openGallery()">📊 Galerie</button>
+      <button class="done-cta" onclick="confirmEmptyTrash()">🗑 Vider la corbeille</button>
+      <button class="done-cta" onclick="wcReset()">⚙ Changer de dossiers</button>
+    </div>
   </div>
   <div id="media-wrap" style="display:none" onclick="videoClick()">
     <div id="overlay-badge">Overlay ON</div>
@@ -3229,6 +3582,30 @@ PAGE = r"""<!DOCTYPE html>
   <div id="sem-grid"></div>
 </div>
 
+<!-- Mode galerie de tri (photos & vidéos, clavier) -->
+<div id="gallery-stage">
+  <div id="gallery-top">
+    <button id="btn-gallery-exit" class="done-cta" onclick="setTriageMode('single')">▭ Un par un</button>
+    <h2>📊 Galerie de tri</h2>
+    <span id="gallery-count"></span>
+    <span style="flex:1"></span>
+    <div id="triage-filter-gal" class="tf-group"></div>
+  </div>
+  <div id="gallery-grid" tabindex="0"></div>
+  <div id="gallery-foot">
+    <span id="gallery-hint">
+      <span class="key">←→↑↓</span> naviguer ·
+      <span class="key">Espace</span>/<span class="key">K</span> garder ·
+      <span class="key">D</span> supprimer ·
+      <span class="key">U</span> annuler ·
+      <span class="key">Entrée</span> valider le lot ·
+      <span class="key">Échap</span> revenir
+    </span>
+    <span id="gallery-marks">0 gardé · 0 supprimé</span>
+    <button id="gallery-validate" onclick="validateGalleryBatch()" disabled>Valider le lot →</button>
+  </div>
+</div>
+
 <!-- Contrôles vidéo (single mode) -->
 <div id="video-ctrl">
   <button id="vc-pp" onclick="vcPlayPause()">⏸</button>
@@ -3239,31 +3616,33 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div id="bar">
-  <button id="btn-back" onclick="act('back')" disabled>← Retour <span class="key">⌫</span></button>
-  <div id="info">
-    <div class="name" id="fname">Chargement…</div>
-    <div class="meta" id="fmeta"></div>
+  <button id="btn-back" onclick="act('back')" disabled>↩ Annuler <span class="key">⌫</span></button>
+  <div class="bar-tools">
+    <button id="btn-rotate" onclick="transformRotate()" title="Rotation 90° horaire [T]">⟳ Pivoter <span class="key">T</span></button>
+    <button id="btn-crop" onclick="openCropOrTrim()" title="Rogner (photo) / Découper (vidéo) [R]" style="display:none">✂ Rogner <span class="key">R</span></button>
+    <button id="btn-overlay" onclick="toggleOverlay()" style="display:none">👁 Overlay <span class="key">↑</span></button>
   </div>
-  <button id="btn-reset" onclick="wcReset()" title="Reconfigurer les dossiers et options">⚙ Accueil</button>
-  <button id="btn-rotate" onclick="transformRotate()" title="Rotation 90° horaire [T]">🔄 <span class="key">T</span></button>
-  <button id="btn-crop"   onclick="openCropOrTrim()" title="Rogner / trim [R]" style="display:none">✂ <span class="key">R</span></button>
-  <button id="btn-empty-trash" onclick="confirmEmptyTrash()" title="Vider Tri/Supprimées vers la Corbeille macOS">🗑 <span id="empty-trash-label">Vider</span></button>
-  <span id="scan-indicator">
-    <button id="btn-rescan" onclick="triggerRescan()" title="Relancer l'analyse des doublons pHash">↻</button>
-  </span>
-  <span id="clip-indicator">
-    <button id="btn-clip-rescan" onclick="triggerClipRescan()" title="Lancer l'analyse IA (CLIP ViT-L/14)">🤖</button>
-  </span>
-<button id="btn-overlay" onclick="toggleOverlay()" style="display:none">👁 Overlay ON <span class="key">↑</span></button>
-  <button id="btn-keep-all"    onclick="actGroupAll()"      style="display:none">Garder toutes <span class="key">→</span></button>
-  <button id="btn-trash-all"  onclick="actGroupTrashAll()" style="display:none">🗑 Supprimer toutes <span class="key">↓</span></button>
-  <button id="btn-sem-validate" onclick="validateSemantic()" style="display:none" disabled>✓ Valider <span class="key">→</span></button>
+  <div class="bar-spacer"></div>
+  <button id="btn-keep-all"    onclick="actGroupAll()"      style="display:none">✓ Tout garder <span class="key">→</span></button>
+  <button id="btn-trash-all"   onclick="actGroupTrashAll()" style="display:none">✕ Tout supprimer <span class="key">↓</span></button>
+  <button id="btn-sem-validate" class="in-bar" onclick="validateSemantic()" style="display:none" disabled>✓ Valider <span class="key">→</span></button>
+  <button id="btn-trash" onclick="act('trash')">✕ Supprimer <span class="key">↓ D</span></button>
   <button id="btn-keep" onclick="act('keep')">✓ Garder <span class="key">→</span></button>
-  <button id="btn-trash" onclick="act('trash')">🗑 Supprimer <span class="key">↓ / D</span></button>
 </div>
 
 <!-- Toast notifications -->
 <div id="toast"></div>
+
+<!-- Overlay de traitement (trim/crop/rotate) avec progression -->
+<div id="processing-overlay">
+  <div id="proc-spinner"></div>
+  <div id="proc-title">Traitement en cours…</div>
+  <div id="proc-warn">⚠ Ne quittez pas et ne faites pas « Retour » : l'opération est en cours.</div>
+  <div id="proc-bar-wrap"><div id="proc-bar"></div></div>
+  <div id="proc-meta"></div>
+  <div id="proc-error"></div>
+  <button id="proc-close" onclick="hideProcessing()">Fermer</button>
+</div>
 
 <!-- Modal de confirmation générique (vider corbeille, etc.) -->
 <div class="modal-back" id="confirm-modal">
@@ -3501,6 +3880,9 @@ function render() {
     return;
   }
   document.getElementById('welcome').style.display = 'none';
+  document.getElementById('gallery-stage').classList.remove('show');
+  document.getElementById('topbar').classList.remove('show');
+  refreshFilterUI();
 
   document.getElementById('btn-keep-all').style.display      = 'none';
   document.getElementById('btn-trash-all').style.display     = 'none';
@@ -3525,20 +3907,18 @@ function render() {
   document.getElementById('trial-wall').style.display = 'none';
 
   if (current.done) {
-    document.getElementById('stage').style.display       = 'flex';
-    document.getElementById('group-stage').style.display = 'none';
-    document.getElementById('sem-stage').style.display   = 'none';
-    document.getElementById('media-wrap').style.display  = 'none';
-    const done = document.getElementById('done');
-    done.style.display = 'flex';
-    document.getElementById('done-msg').textContent =
-      `${current.total} fichiers traités — dossier _a_supprimer prêt à vider`;
-    document.getElementById('bar').style.display           = 'none';
-    document.getElementById('progress-wrap').style.display = 'none';
+    renderDone();
+    return;
+  }
+
+  // Mode galerie : alternative au tri un-par-un (grille clavier, lot).
+  if (triageMode === 'gallery') {
+    renderGalleryMode();
     return;
   }
 
   document.getElementById('bar').style.display           = 'flex';
+  document.getElementById('topbar').classList.add('show');
   document.getElementById('progress-wrap').style.display = '';
   document.getElementById('progress-bar').style.width =
     (current.index / current.total * 100) + '%';
@@ -3550,6 +3930,44 @@ function render() {
     renderSemantic();
   } else {
     renderSingle();
+  }
+}
+
+/* ─── Écran « tri terminé » + CTA ───────────────────────── */
+function renderDone() {
+  document.getElementById('stage').style.display       = 'flex';
+  document.getElementById('group-stage').style.display = 'none';
+  document.getElementById('sem-stage').style.display   = 'none';
+  document.getElementById('media-wrap').style.display  = 'none';
+  document.getElementById('gallery-stage').classList.remove('show');
+  document.getElementById('topbar').classList.remove('show');
+  document.getElementById('done').style.display          = 'flex';
+  document.getElementById('bar').style.display           = 'none';
+  document.getElementById('progress-wrap').style.display = 'none';
+
+  const pending   = current.pending || 0;
+  const filtered  = (current.filter && current.filter !== 'all');
+  const allBtn    = document.getElementById('done-allfilter');
+  const sub       = document.getElementById('done-sub');
+
+  if (filtered && pending > 0) {
+    // File non vide globalement, mais plus rien pour le filtre actif.
+    const label = current.filter === 'video' ? 'vidéo' : 'photo';
+    const other = current.filter === 'video' ? current.pending_photo : current.pending_video;
+    const otherLabel = current.filter === 'video' ? 'photo(s)' : 'vidéo(s)';
+    document.getElementById('done-icon').textContent  = '🎞';
+    document.getElementById('done-title').textContent = `Plus aucune ${label} à trier`;
+    document.getElementById('done-msg').textContent   =
+      `Il reste ${other} ${otherLabel} dans la file.`;
+    sub.textContent = 'Change de filtre pour continuer le tri.';
+    allBtn.style.display = '';
+  } else {
+    document.getElementById('done-icon').textContent  = '✅';
+    document.getElementById('done-title').textContent = 'Tri terminé !';
+    document.getElementById('done-msg').textContent   =
+      `${current.total} fichier(s) traité(s) : dossier _a_supprimer prêt à vider.`;
+    sub.textContent = 'De nouveaux médias dans tes dossiers ? Lance une recherche.';
+    allBtn.style.display = 'none';
   }
 }
 
@@ -3599,6 +4017,7 @@ function renderSingle() {
   } else {
     const img = document.createElement('img');
     img.id    = 'main-img'; img.src = (current.preview_url || current.url) + ts;
+    img.alt   = current.name || 'Média à trier';
     wrap.insertBefore(img, wrap.firstChild);
   }
 
@@ -3608,6 +4027,15 @@ function renderSingle() {
     ov.src       = current.overlay_url + ts;
     ov.className = overlayOn ? '' : 'hidden';
     wrap.insertBefore(ov, document.getElementById('overlay-badge'));
+  }
+
+  // Contrôle contextuel : rogner (photo) vs découper (vidéo).
+  const cbtn = document.getElementById('btn-crop');
+  if (cbtn) {
+    cbtn.style.display = '';
+    cbtn.innerHTML = current.is_video
+      ? '✂ Découper <span class="key">R</span>'
+      : '✂ Rogner <span class="key">R</span>';
   }
 }
 
@@ -3882,6 +4310,12 @@ async function actGroupTrashAll() {
 /* ─── Clavier ────────────────────────────────────────────── */
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
+  // Bloquer toute navigation pendant un traitement (ne pas quitter l'écran).
+  if (document.getElementById('processing-overlay').classList.contains('show')) {
+    e.preventDefault(); return;
+  }
+  // En mode galerie, les touches sont gérées par le handler galerie dédié.
+  if (triageMode === 'gallery' && !current.done) return;
   if (current.mode === 'group') {
     if      (e.key === 'ArrowLeft' || e.key === 'Backspace') { e.preventDefault(); act('back');        }
     else if (e.key === 'ArrowRight')                          { e.preventDefault(); actGroupAll();      }
@@ -4004,11 +4438,11 @@ function closeGallery() {
 }
 async function loadGallery(sort) {
   const grid = document.getElementById('gal-grid');
-  grid.innerHTML = '<p style="color:#777;grid-column:1/-1;padding:20px">Chargement…</p>';
+  grid.innerHTML = '<p style="color:var(--txt-3);grid-column:1/-1;padding:20px">Chargement…</p>';
   try {
     const r = await fetch('/api/gallery?sort=' + encodeURIComponent(sort));
     const d = await r.json();
-    if (!d.ok) { grid.innerHTML = '<p style="color:#e66;grid-column:1/-1;padding:20px">' + (d.error || 'Erreur') + '</p>'; return; }
+    if (!d.ok) { grid.innerHTML = '<p style="color:var(--del);grid-column:1/-1;padding:20px">' + (d.error || 'Erreur') + '</p>'; return; }
     document.getElementById('gal-count').textContent =
       `· ${d.count} fichier(s) · ${d.total_mb} Mo`;
     grid.innerHTML = '';
@@ -4027,9 +4461,9 @@ async function loadGallery(sort) {
          <div style="padding:0 8px 6px;font-size:10px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${it.name}">${it.is_video ? '🎬 ' : ''}${it.name}</div>`;
       grid.appendChild(cell);
     });
-    if (!d.items.length) grid.innerHTML = '<p style="color:#777;grid-column:1/-1;padding:20px">Aucun média.</p>';
+    if (!d.items.length) grid.innerHTML = '<p style="color:var(--txt-3);grid-column:1/-1;padding:20px">Aucun média.</p>';
   } catch (e) {
-    grid.innerHTML = '<p style="color:#e66;grid-column:1/-1;padding:20px">Erreur réseau.</p>';
+    grid.innerHTML = '<p style="color:var(--del);grid-column:1/-1;padding:20px">Erreur réseau.</p>';
   }
 }
 
@@ -4555,30 +4989,47 @@ async function validateTrim() {
   if (!trimState || trimState.end <= trimState.start + 0.1) {
     showToast('Sélection trop courte.', 'error'); return;
   }
-  const btn = document.getElementById('trim-validate');
-  btn.disabled = true; btn.textContent = 'Encodage…';
-  const payload = {
-    action: 'trim',
-    entry:  current.url.replace('/media/', '').replace(/\?t=.*$/, ''),
-    start_s: trimState.start,
-    end_s:   trimState.end,
-  };
+  const entry = current.url.replace('/media/', '').replace(/\?t=.*$/, '');
+  const startedAt = Date.now();
+  // Lance le worker async côté serveur (ré-encodage ffmpeg avec progression).
+  let r, j;
   try {
-    const r = await fetch('/api/transform', {
+    r = await fetch('/api/trim/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ entry, start_s: trimState.start, end_s: trimState.end }),
     });
-    const j = await r.json();
-    if (!j.ok) { showToast('Échec trim : ' + (j.error || ''), 'error', 5000); return; }
-    showToast(`Vidéo coupée (${fmtSec(j.trim.duration_s)}) ✓`, 'success');
-    closeTrim();
-    bustMediaCache();
-  } catch(e) {
-    showToast('Erreur : ' + e.message, 'error', 5000);
-  } finally {
-    btn.textContent = '✓ Valider la coupe';
-    btn.disabled = false;
+    j = await r.json();
+  } catch (e) {
+    showToast('Erreur réseau : ' + e.message, 'error', 5000); return;
   }
+  if (!j.ok) { showToast('Échec trim : ' + (j.error || ''), 'error', 5000); return; }
+
+  closeTrim();
+  showProcessing('Découpage de la vidéo…', true);
+
+  // Polling de la progression toutes les 500 ms.
+  await new Promise((resolve) => {
+    procTimer = setInterval(async () => {
+      let s;
+      try {
+        const sr = await fetch('/api/trim/status');
+        s = await sr.json();
+      } catch (_) { return; }
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      updateProcessing(s.percent || 0, elapsed);
+      if (s.done) {
+        clearInterval(procTimer); procTimer = null;
+        if (s.ok) {
+          hideProcessing();
+          showToast('Vidéo coupée ✓', 'success');
+          bustMediaCache();
+        } else {
+          showProcessingError(s.error || 'Échec du découpage.');
+        }
+        resolve();
+      }
+    }, 500);
+  });
 }
 
 function openCropOrTrim() {
@@ -4587,8 +5038,270 @@ function openCropOrTrim() {
   else                  openCrop();
 }
 
+/* ════════ Mode galerie + filtre type + overlay traitement (v0.7.0) ════════ */
+
+let triageMode   = localStorage.getItem('triageMode') || 'single';
+let galleryItems = [];
+let galleryMarks = {};
+let galleryFocus = 0;
+let procTimer    = null;
+
+const FILTER_LABELS = [['all','Tout'], ['photo','Photos'], ['video','Vidéos']];
+
+function currentFilter() {
+  return (current && current.filter) || window._filter || 'all';
+}
+
+function refreshFilterUI() {
+  const f = currentFilter();
+  window._filter = f;
+  ['triage-filter', 'triage-filter-gal'].forEach((id) => {
+    const host = document.getElementById(id);
+    if (!host) return;
+    host.innerHTML = FILTER_LABELS.map(([v, l]) =>
+      `<button class="tf-btn ${v === f ? 'active' : ''}" onclick="setTriageFilter('${v}')">${l}</button>`
+    ).join('');
+  });
+}
+
+async function setTriageFilter(value) {
+  try {
+    await fetch('/api/triage_filter', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    });
+  } catch (_) {}
+  window._filter = value;
+  if (triageMode === 'gallery') { await renderGalleryMode(); refreshFilterUI(); }
+  else load();
+}
+
+function setTriageMode(mode) {
+  triageMode = mode;
+  localStorage.setItem('triageMode', mode);
+  load();
+}
+
+async function renderGalleryMode() {
+  document.getElementById('stage').style.display         = 'none';
+  document.getElementById('group-stage').style.display   = 'none';
+  document.getElementById('sem-stage').style.display     = 'none';
+  document.getElementById('bar').style.display           = 'none';
+  document.getElementById('topbar').classList.remove('show');
+  document.getElementById('progress-wrap').style.display = 'none';
+  document.getElementById('gallery-stage').classList.add('show');
+  refreshFilterUI();
+
+  const grid = document.getElementById('gallery-grid');
+  grid.innerHTML = '<p style="color:var(--txt-3);grid-column:1/-1;padding:20px">Chargement…</p>';
+  galleryMarks = {}; galleryFocus = 0;
+  updateGalleryMarks();
+
+  const f = currentFilter();
+  let d;
+  try {
+    const r = await fetch(`/api/gallery?scope=queue&type=${f}&sort=date_asc`);
+    d = await r.json();
+  } catch (e) {
+    grid.innerHTML = '<p style="color:var(--del);grid-column:1/-1;padding:20px">Erreur réseau.</p>'; return;
+  }
+  if (!d.ok) {
+    grid.innerHTML = `<p style="color:var(--del);grid-column:1/-1;padding:20px">${d.error || 'Erreur'}</p>`; return;
+  }
+
+  galleryItems = d.items;
+  document.getElementById('gallery-count').textContent = `· ${d.count} à trier · ${d.total_mb} Mo`;
+  if (!galleryItems.length) {
+    grid.innerHTML = '<p style="color:var(--txt-3);grid-column:1/-1;padding:30px;text-align:center">Aucun média à trier pour ce filtre.<br>Change de filtre ou reviens au tri un-par-un.</p>';
+    return;
+  }
+  grid.innerHTML = '';
+  galleryItems.forEach((it, i) => {
+    const cell = document.createElement('div');
+    cell.className = 'g-cell'; cell.tabIndex = -1; cell.dataset.i = i;
+    // Poster JPEG pour les vidéos (un <img> ne peut pas afficher un mp4).
+    const thumb   = it.is_video ? ('/preview/' + it.rel) : (it.preview_url || it.url);
+    const sizeStr = it.size_kb >= 1024 ? (it.size_kb / 1024).toFixed(1) + ' Mo' : it.size_kb + ' Ko';
+    cell.innerHTML =
+      `<div class="g-mark"></div>
+       <div class="g-thumb"><img loading="lazy" src="${thumb}" alt="${it.name}"></div>
+       <div class="g-info"><span style="font-weight:600;color:#fb923c">${sizeStr}</span><span>${it.year}</span></div>
+       <div class="g-name" title="${it.name}">${it.is_video ? '🎬 ' : '🖼 '}${it.name}</div>`;
+    cell.onclick       = () => cycleMark(i);
+    cell.oncontextmenu = (ev) => { ev.preventDefault(); markCell(i, 'trash'); };
+    grid.appendChild(cell);
+  });
+  focusCell(0);
+}
+
+function colCount() {
+  const cells = document.querySelectorAll('#gallery-grid .g-cell');
+  if (cells.length < 2) return 1;
+  const top0 = cells[0].offsetTop;
+  let c = 0;
+  for (const el of cells) { if (el.offsetTop === top0) c++; else break; }
+  return Math.max(1, c);
+}
+
+function focusCell(i) {
+  const cells = document.querySelectorAll('#gallery-grid .g-cell');
+  if (!cells.length) return;
+  galleryFocus = Math.max(0, Math.min(cells.length - 1, i));
+  const el = cells[galleryFocus];
+  el.focus({ preventScroll: false });
+  el.scrollIntoView({ block: 'nearest' });
+}
+
+function _paintCell(i, mark) {
+  const cell = document.querySelector(`#gallery-grid .g-cell[data-i="${i}"]`);
+  if (!cell) return;
+  cell.classList.toggle('keep',  mark === 'keep');
+  cell.classList.toggle('trash', mark === 'trash');
+  const m = cell.querySelector('.g-mark');
+  if (m) m.textContent = mark === 'keep' ? '✓' : (mark === 'trash' ? '✕' : '');
+}
+
+function markCell(i, mark) {
+  const it = galleryItems[i]; if (!it) return;
+  if (galleryMarks[it.rel] === mark) delete galleryMarks[it.rel];
+  else galleryMarks[it.rel] = mark;
+  _paintCell(i, galleryMarks[it.rel]);
+  galleryFocus = i;
+  updateGalleryMarks();
+}
+
+function cycleMark(i) {
+  const it = galleryItems[i]; if (!it) return;
+  const cur  = galleryMarks[it.rel];
+  const next = cur === undefined ? 'keep' : (cur === 'keep' ? 'trash' : undefined);
+  if (next === undefined) delete galleryMarks[it.rel]; else galleryMarks[it.rel] = next;
+  _paintCell(i, next);
+  galleryFocus = i;
+  updateGalleryMarks();
+}
+
+function clearMark(i) {
+  const it = galleryItems[i]; if (!it) return;
+  delete galleryMarks[it.rel];
+  _paintCell(i, undefined);
+  updateGalleryMarks();
+}
+
+function updateGalleryMarks() {
+  const vals = Object.values(galleryMarks);
+  const nk = vals.filter(v => v === 'keep').length;
+  const nt = vals.filter(v => v === 'trash').length;
+  const marksEl = document.getElementById('gallery-marks');
+  if (marksEl) marksEl.textContent = `${nk} gardé · ${nt} supprimé`;
+  const vbtn = document.getElementById('gallery-validate');
+  if (vbtn) vbtn.disabled = (nk + nt) === 0;
+}
+
+async function validateGalleryBatch() {
+  const keep = [], trash = [];
+  Object.entries(galleryMarks).forEach(([rel, m]) => { (m === 'keep' ? keep : trash).push(rel); });
+  if (!keep.length && !trash.length) return;
+  const btn = document.getElementById('gallery-validate');
+  btn.disabled = true; btn.textContent = 'Application…';
+  try {
+    const r = await fetch('/api/gallery_action', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep, trash }),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      showToast('Erreur : ' + (j.error || ''), 'error', 4000);
+      btn.disabled = false; btn.textContent = 'Valider le lot →'; return;
+    }
+    showToast(`${j.processed} média(s) traité(s) ✓`, 'success');
+    btn.textContent = 'Valider le lot →';
+    load();   // reste en galerie sur les restants, ou bascule sur l'écran terminé si vide
+  } catch (e) {
+    showToast('Erreur réseau : ' + e.message, 'error', 4000);
+    btn.disabled = false; btn.textContent = 'Valider le lot →';
+  }
+}
+
+/* Clavier galerie : navigation + marquage + validation */
+document.addEventListener('keydown', (e) => {
+  if (triageMode !== 'gallery') return;
+  if (!document.getElementById('gallery-stage').classList.contains('show')) return;
+  if (document.getElementById('processing-overlay').classList.contains('show')) { e.preventDefault(); return; }
+  if (e.target.matches('input, textarea, select')) return;
+  if (!galleryItems.length) {
+    if (e.key === 'Escape') { e.preventDefault(); setTriageMode('single'); }
+    return;
+  }
+  const cols = colCount();
+  switch (e.key) {
+    case 'ArrowRight': e.preventDefault(); focusCell(galleryFocus + 1); break;
+    case 'ArrowLeft':  e.preventDefault(); focusCell(galleryFocus - 1); break;
+    case 'ArrowDown':  e.preventDefault(); focusCell(galleryFocus + cols); break;
+    case 'ArrowUp':    e.preventDefault(); focusCell(galleryFocus - cols); break;
+    case ' ':
+    case 'k': case 'K': e.preventDefault(); markCell(galleryFocus, 'keep');  break;
+    case 'd': case 'D':
+    case 'Delete':      e.preventDefault(); markCell(galleryFocus, 'trash'); break;
+    case 'u': case 'U': e.preventDefault(); clearMark(galleryFocus); break;
+    case 'Enter':       e.preventDefault(); validateGalleryBatch(); break;
+    case 'Escape':      e.preventDefault(); setTriageMode('single'); break;
+  }
+});
+
+/* Overlay de traitement (trim async, avec progression réelle) */
+function showProcessing(title, determinate) {
+  document.getElementById('proc-title').textContent   = title || 'Traitement en cours…';
+  document.getElementById('proc-error').style.display = 'none';
+  document.getElementById('proc-close').style.display = 'none';
+  document.getElementById('proc-warn').style.display    = '';
+  document.getElementById('proc-spinner').style.display = '';
+  const wrap = document.getElementById('proc-bar-wrap');
+  wrap.style.display = '';
+  wrap.classList.toggle('indeterminate', !determinate);
+  document.getElementById('proc-bar').style.width  = determinate ? '0%' : '35%';
+  document.getElementById('proc-meta').textContent = '';
+  document.getElementById('processing-overlay').classList.add('show');
+}
+
+function updateProcessing(percent, elapsedSec) {
+  document.getElementById('proc-bar-wrap').classList.remove('indeterminate');
+  document.getElementById('proc-bar').style.width = Math.max(0, Math.min(100, percent)) + '%';
+  document.getElementById('proc-meta').textContent = `${percent}%  ·  ${elapsedSec}s écoulées`;
+}
+
+function hideProcessing() {
+  if (procTimer) { clearInterval(procTimer); procTimer = null; }
+  document.getElementById('processing-overlay').classList.remove('show');
+}
+
+function showProcessingError(msg) {
+  document.getElementById('proc-spinner').style.display  = 'none';
+  document.getElementById('proc-warn').style.display     = 'none';
+  document.getElementById('proc-bar-wrap').style.display = 'none';
+  document.getElementById('proc-meta').textContent       = '';
+  const err = document.getElementById('proc-error');
+  err.style.display = ''; err.textContent = msg;
+  document.getElementById('proc-close').style.display = '';
+}
+
+/* CTA écran terminé : recherche manuelle de nouveaux médias */
+async function doRefreshQueue() {
+  showToast('Recherche de nouveaux médias…', 'info', 1500);
+  try {
+    const r = await fetch('/api/refresh_queue', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok && j.added > 0) showToast(`${j.added} nouveau(x) média(s) ajouté(s) ✓`, 'success');
+    else if (j.ok)           showToast('Aucun nouveau média trouvé.', 'info', 2000);
+  } catch (_) {}
+  load();
+}
+
 /* ─── Keyboard : T (rotation) + R (crop/trim) + Escape ──── */
 document.addEventListener('keydown', (e) => {
+  // Pendant un traitement, on bloque tout (y compris Échap) pour éviter de quitter.
+  if (document.getElementById('processing-overlay').classList.contains('show')) {
+    e.preventDefault(); return;
+  }
   // Si une modal ou overlay est ouvert, gérer Echap d'abord
   if (e.key === 'Escape') {
     if (document.getElementById('crop-overlay').classList.contains('show'))    { closeCrop();    e.preventDefault(); return; }
@@ -4618,7 +5331,7 @@ document.addEventListener('keydown', (e) => {
     }
     btn.style.display = '';
     btn.innerHTML = current.is_video
-      ? '✂ Trim <span class="key">R</span>'
+      ? '✂ Découper <span class="key">R</span>'
       : '✂ Rogner <span class="key">R</span>';
   }, 800);
 })();
