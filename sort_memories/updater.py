@@ -28,6 +28,25 @@ USER_AGENT         = f"SortMemories/{CURRENT_VERSION} (auto-updater)"
 HTTP_TIMEOUT       = 10  # secondes
 
 
+# ── Contexte SSL ─────────────────────────────────────────────────────────────
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Contexte SSL avec bundle CA explicite via certifi.
+
+    Dans un bundle PyInstaller figé, `ssl.create_default_context()` ne trouve
+    aucun certificat racine (les chemins OpenSSL par défaut n'existent pas dans
+    le .app) → `CERTIFICATE_VERIFY_FAILED`. certifi embarque cacert.pem, que
+    PyInstaller bundle automatiquement, donc on pointe le contexte dessus.
+    Fallback sur le contexte par défaut si certifi est absent (dev hors bundle).
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 # ── Version compare ──────────────────────────────────────────────────────────
 
 _SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
@@ -78,7 +97,7 @@ def check_latest() -> dict:
             "User-Agent": USER_AGENT,
             "Accept": "application/vnd.github+json",
         })
-        ctx = ssl.create_default_context()
+        ctx = _ssl_context()
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
@@ -115,7 +134,7 @@ def check_latest() -> dict:
 def download_release(url: str, dest_path: Path, progress_cb=None) -> None:
     """Télécharge le zip dans dest_path. progress_cb(bytes_done, total) appelé périodiquement."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    ctx = ssl.create_default_context()
+    ctx = _ssl_context()
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
         total = int(resp.headers.get("Content-Length", 0) or 0)
         done  = 0

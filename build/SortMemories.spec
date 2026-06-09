@@ -3,6 +3,7 @@
 # Output : dist/Sort Memories.app
 
 import os
+import re
 from PyInstaller.utils.hooks import (
     collect_data_files, collect_submodules, collect_dynamic_libs,
 )
@@ -15,6 +16,11 @@ _PROJECT_ROOT = os.path.dirname(_SPEC_DIR)
 _ENTITLEMENTS = os.path.join(_SPEC_DIR, "entitlements.plist")
 _APP_ENTRY = os.path.join(_PROJECT_ROOT, "app.py")
 
+# Version lue depuis sort_memories/__init__.py (source unique de vérité, évite
+# de figer une version obsolète dans le bundle macOS — cf. règle versioning).
+with open(os.path.join(_PROJECT_ROOT, "sort_memories", "__init__.py"), encoding="utf-8") as _f:
+    _APP_VERSION = re.search(r'__version__\s*=\s*"([^"]+)"', _f.read()).group(1)
+
 hiddenimports = []
 hiddenimports += collect_submodules("flask")
 hiddenimports += collect_submodules("webview")
@@ -22,10 +28,12 @@ hiddenimports += collect_submodules("sort_memories")
 hiddenimports += collect_submodules("send2trash")
 hiddenimports += collect_submodules("pillow_heif")   # HEIC/HEIF/AVIF iPhone
 hiddenimports += ["PIL._tkinter_finder", "imagehash", "send2trash",
-                  "pillow_heif", "rawpy", "exifread", "sort_memories.updater"]
+                  "pillow_heif", "rawpy", "exifread", "sort_memories.updater",
+                  "certifi"]   # bundle CA pour l'updater HTTPS (sinon CERTIFICATE_VERIFY_FAILED)
 
 datas = []
 datas += collect_data_files("webview")
+datas += collect_data_files("certifi")   # cacert.pem embarqué (certifi.where())
 
 # Bibliothèques natives : libheif (pillow_heif) + libraw (rawpy). Sans elles,
 # le décodage HEIC/RAW échoue dans le .app bundlé.
@@ -97,12 +105,12 @@ app = BUNDLE(
     name="Sort Memories.app",
     icon=None,
     bundle_identifier="fr.eliottbouquerel.sortmemories",
-    version="0.6.1",
+    version=_APP_VERSION,
     info_plist={
         "CFBundleName": "Sort Memories",
         "CFBundleDisplayName": "Sort Memories",
-        "CFBundleVersion": "0.6.1",
-        "CFBundleShortVersionString": "0.6.1",
+        "CFBundleVersion": _APP_VERSION,
+        "CFBundleShortVersionString": _APP_VERSION,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "12.0",
         "NSHumanReadableCopyright": "© 2026 Eliott Bouquerel. Tous droits réservés.",

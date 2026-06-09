@@ -44,7 +44,7 @@ jobs:
       - name: Installer les dependances de build
         run: |
           python -m pip install --upgrade pip
-          pip install flask pillow pillow-heif rawpy exifread imagehash numpy pywebview appdirs send2trash pyinstaller
+          pip install flask pillow pillow-heif rawpy exifread imagehash numpy pywebview appdirs send2trash certifi pyinstaller
       - name: Build PyInstaller
         run: pyinstaller build/SortMemories.spec --clean --noconfirm --distpath dist --workpath build/work
       - name: Verifier le bundle

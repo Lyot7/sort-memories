@@ -2717,7 +2717,7 @@ _update_state = {
     "checked":     False,        # True dès qu'un check (réussi ou non) a été fait
     "checking":    False,        # True pendant le fetch GitHub API
     "ok":          False,        # True si le dernier check a abouti
-    "current":     "",           # version courante
+    "current":     _updater.CURRENT_VERSION,  # version courante (dispo dès le boot, sans réseau)
     "latest":      None,         # tag de la dernière release
     "available":   False,        # update dispo ?
     "url":         None,         # URL du zip
@@ -5433,6 +5433,10 @@ function renderUpdateState(s, verbose) {
   const size   = document.getElementById('wc-update-size');
 
   if (btn) { btn.disabled = false; btn.textContent = 'Vérifier maintenant'; }
+
+  // Garantit l'affichage de la version même si le fetch initial avait précédé le check
+  const cur = document.getElementById('wc-current-version');
+  if (cur && s.current) cur.textContent = 'v' + s.current;
 
   if (!s.ok) {
     if (msg) msg.textContent = s.error || 'Vérification impossible.';

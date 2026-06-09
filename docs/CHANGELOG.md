@@ -1,5 +1,24 @@
 # Changelog
 
+## [2026-06-09] v0.8.3 : fix auto-updater (SSL via certifi + version affichée)
+
+**Type** : Bugfix
+**Fichiers modifiés** : `sort_memories/updater.py` (helper `_ssl_context`), `sort_memories/core.py` (init `_update_state["current"]` + `renderUpdateState`), `build/SortMemories.spec` (certifi bundlé + version dynamique), `scripts/build-macos.sh`, `.github/workflows/{ci,release}.yml`, `pyproject.toml` (dépendance `certifi`)
+
+**Symptôme** : dans l'app installée, la section « Mises à jour » affichait `Version installée : v?.?.?` et l'erreur `[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate` au lieu de vérifier les nouvelles versions.
+
+**Causes racines** :
+1. **SSL** : `ssl.create_default_context()` ne trouve aucun certificat racine dans le bundle PyInstaller figé (les chemins OpenSSL par défaut n'existent pas dans le `.app`). En dev hors bundle le système fournit les certs, d'où un bug invisible en local.
+2. **`v?.?.?`** : `_update_state["current"]` était initialisé à `""`. Au boot, `initUpdateUI` lisait le status avant la fin du check réseau, récupérait une version vide, et l'élément restait sur le placeholder HTML `v?.?.?` (jamais ré-affiché ensuite).
+
+**Correctif** :
+- Nouveau helper `_ssl_context()` qui crée le contexte SSL avec `certifi.where()` (bundle CA embarqué par PyInstaller), fallback sur le contexte par défaut hors bundle. Utilisé par `check_latest` et `download_release`.
+- `certifi` ajouté aux dépendances, au `pip install` des deux workflows + du script de build, en `hiddenimport` et `collect_data_files` du spec.
+- `_update_state["current"]` initialisé à `__version__` (dispo dès le boot, sans réseau). `renderUpdateState` ré-affiche la version par sécurité.
+- Spec : version lue dynamiquement depuis `__init__.py` (fin du `CFBundleVersion` figé à 0.6.1).
+
+**Vérification** : `check_latest()` réussit (ok=True, plus d'erreur SSL), `GET /api/update/status` renvoie `current=0.8.3` dès le boot sans check réseau. Lint ruff vert. Le bundle CA dans le `.app` sera validé par le build CI macOS.
+
 ## [2026-06-09] v0.8.2 : préserver l'EXIF lors de la rotation et du rognage
 
 **Type** : Bugfix

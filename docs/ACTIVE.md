@@ -1,10 +1,10 @@
 # État actuel du projet
 
-**Dernière mise à jour** : 2026-06-08
+**Dernière mise à jour** : 2026-06-09
 
 ## En cours
 
-v0.8.0 implémentée : refonte UI complète « Calme & Pro » (design system from scratch, chrome en deux barres, tous les écrans harmonisés). Backend et logique inchangés. Vérifiée par inspection visuelle de chaque écran (zéro erreur console). Reste : rebuild du `.app` (`./scripts/build-macos.sh`) + test manuel sur un dossier iPhone réel (HEIC + MOV) avant release.
+v0.8.3 : fix de l'auto-updater. Dans l'app installée, la section « Mises à jour » affichait `v?.?.?` + une erreur `SSL: CERTIFICATE_VERIFY_FAILED`. Deux causes : pas de bundle CA dans le `.app` PyInstaller (corrigé via `certifi.where()`) et `_update_state["current"]` initialisé vide (corrigé en l'initialisant à `__version__`). Vérifié en local (check réseau OK, version affichée dès le boot) ; le bundle CA dans le `.app` sera validé par le build CI macOS au merge.
 
 ## Fait récemment (v0.8.0)
 
