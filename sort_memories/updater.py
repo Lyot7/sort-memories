@@ -16,8 +16,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 from sort_memories import __version__ as CURRENT_VERSION

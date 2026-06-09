@@ -1,0 +1,78 @@
+name: Release
+
+# Sur chaque merge dans main : si la version (sort_memories/__init__.py) n'a pas
+# encore de Release GitHub, build le .app macOS et publie la Release `vX.Y.Z`
+# avec le zip en asset. L'updater in-app cherche un asset `.zip` contenant `macos`.
+# Idempotent : si la Release existe deja, le job ne fait rien.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build + publier la Release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lire la version
+        id: ver
+        run: |
+          V=$(python -c "import re; s=open('sort_memories/__init__.py', encoding='utf-8').read(); print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', s).group(1))")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "Version detectee : v$V"
+
+      - name: La Release existe-t-elle deja ?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.ver.outputs.tag }} deja publiee, rien a faire."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Pas de Release ${{ steps.ver.outputs.tag }}, build + publication."
+          fi
+
+      - name: Installer les dependances de build
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask pillow pillow-heif rawpy exifread imagehash numpy pywebview appdirs send2trash pyinstaller
+
+      - name: Build PyInstaller
+        if: steps.check.outputs.exists == 'false'
+        run: pyinstaller build/SortMemories.spec --clean --noconfirm --distpath dist --workpath build/work
+
+      - name: Zipper le bundle (ditto preserve symlinks + bit executable)
+        if: steps.check.outputs.exists == 'false'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Sort Memories.app" "dist/SortMemories-macos-${{ steps.ver.outputs.tag }}.zip"
+
+      - name: Publier la Release GitHub
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "dist/SortMemories-macos-${{ steps.ver.outputs.tag }}.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Sort Memories ${{ steps.ver.outputs.tag }}" \
+            --generate-notes

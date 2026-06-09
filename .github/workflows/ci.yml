@@ -1,0 +1,53 @@
+name: CI
+
+# Validation sur chaque PR vers main : lint (rapide, Linux) + build sanity (.app, macOS).
+# Les changements purement docs ne lancent rien (economie de minutes macOS).
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint + syntaxe (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Installer ruff
+        run: pip install ruff==0.15.15
+      - name: Ruff
+        run: ruff check sort_memories/
+      - name: Verifier la syntaxe (AST)
+        run: python -c "import ast; ast.parse(open('sort_memories/core.py', encoding='utf-8').read()); print('AST OK')"
+
+  build:
+    name: Build .app (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Installer les dependances de build
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask pillow pillow-heif rawpy exifread imagehash numpy pywebview appdirs send2trash pyinstaller
+      - name: Build PyInstaller
+        run: pyinstaller build/SortMemories.spec --clean --noconfirm --distpath dist --workpath build/work
+      - name: Verifier le bundle
+        run: |
+          test -d "dist/Sort Memories.app"
+          echo "Bundle OK : $(du -sh 'dist/Sort Memories.app' | cut -f1)"

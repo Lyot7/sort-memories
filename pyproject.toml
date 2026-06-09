@@ -51,3 +51,11 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+# core.py contient toute l'UI (HTML/CSS/JS) embarquee dans la string PAGE :
+# les longues lignes (E501), imports tardifs apres setup des chemins (E402) et
+# le style "try/except/pass" defensif (SIM) y sont assumes. On garde F (vrais
+# bugs), E9, UP et B actifs partout. updater.py : longues URLs + suppress defensif.
+[tool.ruff.lint.per-file-ignores]
+"sort_memories/core.py"    = ["E501", "E402", "SIM105", "SIM102", "SIM115"]
+"sort_memories/updater.py" = ["E501", "SIM105"]
