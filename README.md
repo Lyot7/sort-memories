@@ -6,18 +6,21 @@
 
 ## Pitch
 
-Vos dossiers `Photos`, `Téléchargements`, `Snapchat`, `iCloud Drive` débordent ? Sort Memories ouvre un dossier local, détecte les doublons (pHash + recherche sémantique CLIP), et vous fait défiler chaque média un par un avec deux raccourcis : **garder** ou **supprimer**. À la fin, votre dossier est rangé par année et les fichiers à virer sont dans un `_a_supprimer/` que vous videz à la corbeille.
+Vos dossiers `Photos`, `Téléchargements`, `Snapchat`, `iCloud Drive` débordent ? Sort Memories ouvre un dossier local, détecte les doublons (pHash + recherche sémantique CLIP), et vous fait défiler chaque fichier un par un avec deux raccourcis : **garder** ou **supprimer**. Les fichiers gardés restent à leur emplacement d'origine ; ceux à virer atterrissent dans un dossier unique `À supprimer/` à la racine, que vous videz à la corbeille quand tout est trié.
 
 Conçu pour traiter des milliers de fichiers en une session, sans uploader quoi que ce soit dans le cloud — **tout reste sur votre machine**.
 
 ## Fonctionnalités
 
 - 📁 **Écran d'accueil** : ajoute N dossiers source, choisis tes options, démarre — pas de Finder intrusif au lancement
-- 🗂️ **Options de tri combinables** : grouper par année / aussi par mois / séparer images-vidéos / renommer en `YYYY-MM-DD_<hash>.ext`
+- 📌 **Tri sans déplacement** : par défaut, un fichier gardé **reste exactement où il était**. Aucun dossier `Gardées/` créé.
+- 🗂️ **Rangement optionnel** (désactivé par défaut) : si tu l'actives, les fichiers gardés sont réorganisés à la racine de leur source par année / mois / type, ou renommés en `YYYY-MM-DD_<hash>.ext`
+- 🧹 **Tous les types de fichiers** : images, vidéos, **audio** (mp3, flac, wav…), **documents** (PDF, docx, txt, md, odt, xlsx, epub…) et **archives** (zip, 7z, tar…) pour nettoyer largement. Les bundles/exécutables système sont exclus.
 - 🖼️ **Triage rapide** : flèches gauche/droite pour parcourir, `D` pour supprimer, `O` pour overlay
 - 🔄 **Rotation 90°** : raccourci `T` — applique in-place sur image et vidéo
 - ✂ **Crop image / Trim vidéo** : raccourci `R` — drag-to-select sur image, timeline double-handle sur vidéo
-- 🗑 **Vider la corbeille** : bouton qui envoie tous les `Tri/Supprimées/` à la Corbeille macOS (réversible)
+- 🗑 **Vider la corbeille** : bouton qui envoie le dossier `À supprimer/` à la Corbeille macOS (réversible)
+- 👁️ **Aperçu réel par type** : PDF affiché en page, texte et markdown lisibles, lecteur audio intégré, carte icône (nom, taille, date) pour le reste
 - ↶ **Undo** : `←` revient en arrière sans perdre l'état (keep et delete réversibles)
 - 🔍 **Déduplication pHash** : détecte les copies exactes ou re-encodées (resize, conversion JPG↔PNG, etc.)
 - 🖼 **Tous les formats** : photos JPG/PNG/GIF/WebP/**HEIC**/HEIF/AVIF/TIFF/BMP/**RAW** (DNG/CR2/NEF/ARW…) et vidéos MP4/MOV/M4V/AVI/MKV/WMV/3GP/MTS/WEBM…
@@ -69,8 +72,8 @@ Signature Apple Developer ID + notarisation arrivent avec la version commerciale
 2. Sélectionne le dossier à trier (ex : `~/Pictures/Snapchat`, un dossier de captures, etc.)
 3. Lance le scan de doublons via le bouton ↻ dans l'UI (pHash, ~5 ms/image)
 4. Tri au clavier : `→` garder, `←` retour, `D` supprimer, `O` overlay
-5. Les fichiers gardés sont rangés dans `<dossier>/Gardés/<année>/`
-6. Les fichiers à virer atterrissent dans `<dossier>/_a_supprimer/` — videz-le dans la corbeille macOS quand tout est trié
+5. Les fichiers gardés **restent à leur emplacement d'origine** (sauf si tu actives une option de rangement)
+6. Les fichiers à virer atterrissent dans `<dossier>/À supprimer/` : videz-le dans la corbeille macOS quand tout est trié
 
 **Note** : la recherche sémantique CLIP n'est PAS bundlée (gain de 2 GB sur le téléchargement). Elle arrivera en v0.6+ — téléchargée à la demande au premier usage. La détection de doublons pHash, elle, est entièrement fonctionnelle.
 
