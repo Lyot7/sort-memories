@@ -1,10 +1,12 @@
 # État actuel du projet
 
-**Dernière mise à jour** : 2026-06-09
+**Dernière mise à jour** : 2026-06-10
 
 ## En cours
 
-v0.8.3 : fix de l'auto-updater. Dans l'app installée, la section « Mises à jour » affichait `v?.?.?` + une erreur `SSL: CERTIFICATE_VERIFY_FAILED`. Deux causes : pas de bundle CA dans le `.app` PyInstaller (corrigé via `certifi.where()`) et `_update_state["current"]` initialisé vide (corrigé en l'initialisant à `__version__`). Vérifié en local (check réseau OK, version affichée dès le boot) ; le bundle CA dans le `.app` sera validé par le build CI macOS au merge.
+v0.9.0 : refonte du modèle de tri. (1) Garder = in-place (plus de `Tri/Gardées/`, le rangement par année devient optionnel et OFF par défaut). (2) Un seul dossier `À supprimer/` à la racine du dossier sélectionné. (3) Prise en charge de tous les types de fichiers (audio, PDF, docs bureautiques, markdown, archives), hors bundles/exécutables système. (4) Aperçu réel par type : PDF iframe, texte, lecteur audio, carte icône. Validé end-to-end (disque + navigateur). Reste avant release : rebuild du `.app` + test sur dossiers réels variés.
+
+v0.8.3 (inclus dans cette branche) : fix de l'auto-updater (SSL via `certifi.where()` + version affichée dès le boot).
 
 ## Fait récemment (v0.8.0)
 

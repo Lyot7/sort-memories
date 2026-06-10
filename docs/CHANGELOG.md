@@ -1,5 +1,25 @@
 # Changelog
 
+## [2026-06-10] v0.9.0 : tri in-place + corbeille unique + tous types de fichiers
+
+**Type** : Feature
+**Fichiers modifiés** : `sort_memories/core.py`
+
+**Changements de comportement** :
+1. **Garder = in-place** : un fichier gardé reste désormais à son emplacement d'origine. Fini le déplacement automatique vers `Tri/Gardées/`. Le rangement par année/mois/type devient une **option désactivée par défaut** (si activée, les fichiers gardés sont réorganisés à la racine de leur source).
+2. **Dossier « À supprimer » unique** : les fichiers supprimés vont dans un seul dossier `À supprimer/` à la racine du dossier sélectionné (au lieu d'un `Tri/Supprimées/` par source). Le bouton « Vider » et le badge pointent dessus.
+3. **Tous types de fichiers** : en plus des images et vidéos, l'app prend en charge l'audio (mp3, flac, wav, m4a…), les documents (PDF, docx, txt, md, odt, xlsx, epub…) et les archives (zip, 7z, tar…), pour nettoyer largement. Les bundles/exécutables macOS (`.app`, `.framework`, `.photoslibrary`…) sont exclus par sécurité.
+4. **Aperçu réel par type** : PDF rendu nativement (iframe WKWebView), texte/markdown affiché en texte, audio web avec lecteur, et carte icône (type + nom + taille + date) pour le reste. Les outils Pivoter/Rogner sont masqués hors images/vidéos.
+
+**Détails techniques** :
+- `compute_keep_destination` retourne le chemin actuel quand aucune option de rangement n'est active → `move_to_gardes` ne déplace rien. L'undo est protégé contre le déplacement identité.
+- Nouveau dossier corbeille via `_trash_root()` ; `compute_trash_destination`, `trash_info`, `empty_trash` mis à jour.
+- Nouvelles familles d'extensions (`AUDIO_EXT`, `DOC_EXT`/`TEXT_EXT`, `ARCHIVE_EXT`) ; `MEDIA_EXT` = union ; `CONVERTIBLE_EXT` (images/vidéos) réservé à la compression. Helpers `_media_kind`, `_viewer`, `_parts_excluded` (bundles).
+- Payloads `/api/state` et `/api/gallery` enrichis de `kind`/`viewer` ; `/media` sert les fichiers texte en `text/plain`. Galerie : icône typée pour les non-images.
+- Visibilité des outils d'édition centralisée (`updateEditButtons` + raccourcis T/R gardés).
+
+**Vérification** : test end-to-end sur dossier réel (sous-dossiers + jpg/pdf/md/wma/zip) — garde in-place confirmée sur disque, suppression vers `À supprimer/`, aucun `Tri/` recréé. Aperçus PDF/texte/audio/icône validés en navigateur (screenshots). Galerie avec vignettes images + icônes typées. Lint ruff vert.
+
 ## [2026-06-09] v0.8.3 : fix auto-updater (SSL via certifi + version affichée)
 
 **Type** : Bugfix

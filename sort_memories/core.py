@@ -131,15 +131,80 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif",
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".flv", ".3gp",
              ".3g2", ".mpg", ".mpeg", ".webm", ".ts", ".mts", ".m2ts", ".hevc"}
 
-MEDIA_EXT = IMAGE_EXT | VIDEO_EXT
+# Audio (lecture / nettoyage). Sous-ensemble lisible nativement par WKWebView dans WEB_AUDIO_EXT.
+AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus",
+             ".wma", ".aiff", ".aif", ".alac", ".amr", ".mid", ".midi", ".ac3"}
+
+# Texte brut (rendu directement en texte dans l'aperçu via /media en text/plain).
+TEXT_EXT = {".txt", ".md", ".markdown", ".csv", ".tsv", ".log", ".json", ".xml",
+            ".yaml", ".yml", ".ini", ".srt", ".vtt", ".rtf"}
+
+# Documents (PDF rendu nativement par WKWebView ; bureautique/ebooks → icône).
+DOC_EXT = {".pdf", ".doc", ".docx", ".odt", ".pages", ".xls", ".xlsx", ".ods",
+           ".numbers", ".ppt", ".pptx", ".odp", ".key", ".epub", ".mobi", ".djvu"} | TEXT_EXT
+
+# Archives (jamais ouvertes — triables pour nettoyage, affichées en icône).
+ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz",
+               ".tbz", ".tbz2", ".zst", ".lz", ".lz4", ".cab", ".iso", ".dmg"}
+
+# Tout ce que l'app prend en charge pour le tri (hors exécutables/bundles système, cf. _BUNDLE_SUFFIXES).
+MEDIA_EXT = IMAGE_EXT | VIDEO_EXT | AUDIO_EXT | DOC_EXT | ARCHIVE_EXT
+
+# Seuls ces types passent par la compression (WebP / H.265) — pas les docs/audio/archives.
+CONVERTIBLE_EXT = IMAGE_EXT | VIDEO_EXT
+
+# Conteneurs/bundles macOS à ne jamais explorer (sécurité : pas de fichiers système/app).
+_BUNDLE_SUFFIXES = {".app", ".framework", ".bundle", ".photoslibrary", ".rtfd",
+                    ".lproj", ".xcassets", ".pkg", ".plugin", ".kext", ".xcodeproj",
+                    ".aplibrary", ".tvlibrary", ".musiclibrary"}
 
 # Sous-ensembles rendus nativement par WKWebView (sinon → preview JPEG généré, cf. /preview).
 WEB_IMG_EXT   = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif"}
 WEB_VIDEO_EXT = {".mp4", ".mov", ".m4v"}
+WEB_AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac"}
+
+def _media_kind(rel: str) -> str:
+    """Catégorie d'un fichier : image | video | audio | document | archive | other."""
+    ext = Path(rel).suffix.lower()
+    if ext in IMAGE_EXT:
+        return "image"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in AUDIO_EXT:
+        return "audio"
+    if ext in ARCHIVE_EXT:
+        return "archive"
+    if ext in DOC_EXT:
+        return "document"
+    return "other"
+
+def _viewer(rel: str) -> str:
+    """Mode d'aperçu côté UI : image | video | audio | pdf | text | icon."""
+    ext = Path(rel).suffix.lower()
+    if ext in IMAGE_EXT:
+        return "image"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in WEB_AUDIO_EXT:
+        return "audio"
+    if ext == ".pdf":
+        return "pdf"
+    if ext in TEXT_EXT:
+        return "text"
+    return "icon"
 
 def _is_web_renderable(rel: str) -> bool:
-    """True si WKWebView peut afficher le fichier directement (sinon preview JPEG)."""
-    return Path(rel).suffix.lower() in (WEB_IMG_EXT | WEB_VIDEO_EXT)
+    """True si le fichier n'a PAS besoin d'un JPEG d'aperçu généré côté serveur.
+
+    False uniquement pour les images/vidéos non rendues nativement (RAW, TIFF,
+    AVI, MKV…) → /preview JPEG. Les audio/docs/archives renvoient True : ils sont
+    rendus côté JS selon leur `viewer` (audio natif, PDF natif, texte, icône)."""
+    ext = Path(rel).suffix.lower()
+    if ext in IMAGE_EXT:
+        return ext in WEB_IMG_EXT
+    if ext in VIDEO_EXT:
+        return ext in WEB_VIDEO_EXT
+    return True
 
 def _entry_is_video(entry: str) -> bool:
     """True si l'entry pointe vers une vidéo (selon l'extension)."""
@@ -150,14 +215,17 @@ def _entry_matches_filter(entry: str, ftype: str) -> bool:
     if ftype == "video":
         return _entry_is_video(entry)
     if ftype == "photo":
-        return not _entry_is_video(entry)
+        return _is_image(_entry_rel(entry))
     return True
 
 # Filtre de tri actif (en mémoire, partagé single + galerie) : 'all' | 'photo' | 'video'.
 _triage_filter = "all"
 
 DEFAULT_OPTIONS = {
-    "by_year":     True,
+    # Rangement OFF par défaut : un fichier gardé reste à son emplacement d'origine.
+    # Si une de ces options est activée, les fichiers gardés sont rangés à la racine
+    # de leur source (cf. compute_keep_destination).
+    "by_year":     False,
     "by_month":    False,
     "split_media": False,
     "rename":      False,
@@ -255,23 +323,40 @@ def _is_image(rel: str) -> bool:
 def _is_video(rel: str) -> bool:
     return Path(rel).suffix.lower() in VIDEO_EXT
 
+# Nom du dossier unique « À supprimer » (un seul, à la racine de la 1re source).
+TRASH_FOLDER_NAME = "À supprimer"
+
+def _trash_root() -> Path:
+    """Dossier unique « À supprimer », à la racine de la 1re source (ou MEDIA_DIR)."""
+    srcs = _sources()
+    base = srcs[0] if srcs else MEDIA_DIR
+    return base / TRASH_FOLDER_NAME
+
 def compute_keep_destination(entry: str) -> Path:
-    """Calcule le chemin de destination pour un fichier 'gardé' selon les options.
+    """Chemin de destination d'un fichier 'gardé'.
 
-    Structure : <source>/Tri/Gardées/[images|videos/]/[YYYY/]/[MM/]/[renamed_]filename
+    Par défaut (aucune option de rangement active) : le fichier RESTE à sa place
+    — on retourne son chemin actuel, donc move_to_gardes ne déplace rien.
+
+    Si une option de rangement est active (split_media / by_year / by_month /
+    rename), le fichier est rangé à la racine de sa source :
+    <source>/[images|videos|audio|documents|archives/]/[YYYY/]/[MM/]/[renamed_]filename
     """
-    src    = _entry_source(entry)
-    rel    = _entry_rel(entry)
-    opts   = _opts()
-    parts  = [src, "Tri", "Gardées"]
+    src     = _entry_source(entry)
+    rel     = _entry_rel(entry)
+    opts    = _opts()
+    current = _entry_path(entry)
 
+    organizing = any(opts.get(k) for k in ("split_media", "by_year", "by_month", "rename"))
+    if not organizing:
+        return current   # in-place : on ne bouge rien
+
+    parts = [src]
     if opts.get("split_media"):
-        if _is_image(rel):
-            parts.append("images")
-        elif _is_video(rel):
-            parts.append("videos")
-        else:
-            parts.append("autres")
+        parts.append({
+            "image": "images", "video": "videos", "audio": "audio",
+            "document": "documents", "archive": "archives",
+        }.get(_media_kind(rel), "autres"))
 
     # Date de capture RÉELLE (EXIF/creation_time/nom/mtime), pas la date de fichier.
     capture_dt = _capture_datetime(entry)
@@ -298,6 +383,8 @@ def compute_keep_destination(entry: str) -> Path:
     dst_dir = Path(*[str(p) for p in parts])
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / name
+    if dst.resolve() == current.resolve():
+        return current   # déjà au bon endroit → no-op
     n = 1
     while dst.exists():
         dst = dst_dir / f"{Path(name).stem}_{n}{Path(name).suffix}"
@@ -305,10 +392,9 @@ def compute_keep_destination(entry: str) -> Path:
     return dst
 
 def compute_trash_destination(entry: str) -> Path:
-    """Chemin de la corbeille pour un fichier supprimé : <source>/Tri/Supprimées/<name>."""
-    src     = _entry_source(entry)
+    """Chemin dans le dossier unique « À supprimer » global (cf. _trash_root)."""
     rel     = _entry_rel(entry)
-    dst_dir = src / "Tri" / "Supprimées"
+    dst_dir = _trash_root()
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / Path(rel).name
     n = 1
@@ -689,10 +775,19 @@ def load_hash_cache() -> dict:
 def save_hash_cache(cache: dict):
     CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False))
 
+def _parts_excluded(rel_parts, skip_dirs) -> bool:
+    """True si un segment du chemin est un dossier à ignorer OU un bundle système."""
+    for part in rel_parts:
+        if part in skip_dirs:
+            return True
+        if Path(part).suffix.lower() in _BUNDLE_SUFFIXES:
+            return True
+    return False
+
 def all_scannable_files() -> list:
     """Tous les médias sous les sources configurées, à scanner pour pHash."""
     result = []
-    skip_dirs = {"_a_supprimer", "Tri"}
+    skip_dirs = {"_a_supprimer", "Tri", TRASH_FOLDER_NAME}
     for src in _sources():
         if not src.exists():
             continue
@@ -707,7 +802,7 @@ def all_scannable_files() -> list:
                 rel_parts = f.relative_to(src).parts
             except Exception:
                 continue
-            if any(part in skip_dirs for part in rel_parts):
+            if _parts_excluded(rel_parts, skip_dirs):
                 continue
             result.append(f)
     return result
@@ -1176,7 +1271,7 @@ def collect_files():
     if not _is_configured():
         return []
     files = []
-    skip_dirs = {"_a_supprimer", "Tri", "Gardés", "Gardes"}
+    skip_dirs = {"_a_supprimer", "Tri", "Gardés", "Gardes", "Gardées", "Supprimées", TRASH_FOLDER_NAME}
     for idx, src in enumerate(_sources()):
         if not src.exists():
             continue
@@ -1191,7 +1286,7 @@ def collect_files():
                 rel_parts = f.relative_to(src).parts
             except Exception:
                 continue
-            if any(part in skip_dirs for part in rel_parts):
+            if _parts_excluded(rel_parts, skip_dirs):
                 continue
             files.append(_make_entry(idx, str(f.relative_to(src))))
     return files
@@ -1269,8 +1364,11 @@ def merge_overlay(main_path: Path, overlay_path: Path):
             raise RuntimeError(result.stderr.decode()[-300:])
 
 def move_to_gardes(entry: str, overlay_entry: str = None, overlay_visible: bool = True) -> dict:
-    """Déplace immédiatement un fichier vers <source>/Tri/Gardées/[options]/.
+    """Valide un fichier 'gardé'.
 
+    Par défaut le fichier RESTE à sa place (in-place) : compute_keep_destination
+    retourne son chemin actuel et aucun déplacement n'a lieu. Si une option de
+    rangement est active, il est déplacé vers la destination calculée.
     Fusionne l'overlay si visible, le trash sinon.
     Retourne un dict avec les chemins (absolus) pour permettre l'undo.
     """
@@ -1293,11 +1391,13 @@ def move_to_gardes(entry: str, overlay_entry: str = None, overlay_visible: bool 
             result["overlay_trashed"]    = overlay_entry
             result["overlay_trash_path"] = odst
 
-    shutil.move(str(src), str(dst))
+    # In-place : ne déplacer que si la destination diffère réellement de l'origine.
+    if dst.resolve() != src.resolve():
+        shutil.move(str(src), str(dst))
     return result
 
 def trash_file(entry):
-    """Déplace un fichier vers <source>/Tri/Supprimées/. Retourne le chemin absolu de destination."""
+    """Déplace un fichier vers le dossier unique « À supprimer ». Retourne le chemin absolu."""
     src = _entry_path(entry)
     if not src.exists():
         return None
@@ -1505,6 +1605,8 @@ def api_state():
                     "url":         f"/media/{r}",
                     "preview_url": None if _is_web_renderable(rel_only) else f"/preview/{r}",
                     "is_video":    Path(rel_only).suffix.lower() in VIDEO_EXT,
+                    "kind":        _media_kind(rel_only),
+                    "viewer":      _viewer(rel_only),
                     "size_kb":     round(p.stat().st_size / 1024) if p.exists() else 0,
                     "resolution":  f"{res[0]}×{res[1]}" if res else "?",
                     "date":        _year_label(r),
@@ -1542,6 +1644,8 @@ def api_state():
                     "url":         f"/media/{r}",
                     "preview_url": None if _is_web_renderable(_entry_rel(r)) else f"/preview/{r}",
                     "is_video":    Path(r).suffix.lower() in VIDEO_EXT,
+                    "kind":        _media_kind(_entry_rel(r)),
+                    "viewer":      _viewer(_entry_rel(r)),
                     "size_kb":     round(p.stat().st_size / 1024) if p.exists() else 0,
                     "resolution":  f"{res[0]}×{res[1]}" if res else "?",
                     "date":        _year_label(r),
@@ -1578,6 +1682,9 @@ def api_state():
         "url":            f"/media/{rel}",
         "preview_url":    None if _is_web_renderable(rel_only) else f"/preview/{rel}",
         "is_video":       ext in VIDEO_EXT,
+        "kind":           _media_kind(rel_only),
+        "viewer":         _viewer(rel_only),
+        "size_kb":        round(_entry_path(rel).stat().st_size / 1024) if _entry_path(rel).exists() else 0,
         "can_back":       len(s["history"]) > 0,
         "overlay_url":    f"/media/{overlay}" if overlay else None,
         "overlay_rel":    overlay,
@@ -1610,16 +1717,19 @@ def api_action():
                 otp = item.get("overlay_trash_path")
                 if otp and Path(otp).exists():
                     shutil.move(otp, str(_entry_path(item["overlay_rel"])))
-            # Restore kept file(s) from leur Tri/Gardées/
+            # Restore kept file(s) — uniquement s'ils ont réellement été déplacés
+            # (en mode in-place, kept_path == emplacement d'origine → rien à faire).
             if last["action"] == "keep_from_group":
                 kept_path = last.get("kept_path")
-                if kept_path and Path(kept_path).exists():
-                    shutil.move(kept_path, str(_entry_path(last["file"])))
+                orig = _entry_path(last["file"])
+                if kept_path and Path(kept_path).exists() and Path(kept_path).resolve() != orig.resolve():
+                    shutil.move(kept_path, str(orig))
             elif last["action"] in ("keep_all_group", "decide_semantic_group"):
                 for item in last.get("kept_items", []):
                     kp = item.get("kept_path")
-                    if kp and Path(kp).exists():
-                        shutil.move(kp, str(_entry_path(item["file"])))
+                    orig = _entry_path(item["file"])
+                    if kp and Path(kp).exists() and Path(kp).resolve() != orig.resolve():
+                        shutil.move(kp, str(orig))
             # Re-insert group files at current position
             group_files       = last.get("group_files_at_time", [])
             current_files_set = set(s["files"])
@@ -1644,8 +1754,9 @@ def api_action():
         elif last["action"] == "keep":
             target_file = last["file"]
             kept_path   = last.get("kept_path")
-            if kept_path and Path(kept_path).exists():
-                shutil.move(kept_path, str(_entry_path(target_file)))
+            orig        = _entry_path(target_file)
+            if kept_path and Path(kept_path).exists() and Path(kept_path).resolve() != orig.resolve():
+                shutil.move(kept_path, str(orig))
             if last.get("overlay_trashed") and last.get("overlay_trash_path"):
                 otp = Path(last["overlay_trash_path"])
                 if otp.exists():
@@ -1679,7 +1790,7 @@ def api_action():
                 item["overlay_trash_path"] = odst
             trashed.append(item)
 
-        # Déplacer immédiatement le fichier gardé vers Gardés/YYYY/
+        # Valider le fichier gardé (reste in-place sauf option de rangement active)
         ov_keep     = find_overlay(keep_rel)
         keep_result = move_to_gardes(keep_rel, ov_keep, True)
 
@@ -1703,7 +1814,7 @@ def api_action():
         files_set   = set(files)
         in_queue    = [p for p in group_paths if p in files_set]
 
-        # Déplacer immédiatement tous les fichiers du groupe vers Gardés/YYYY/
+        # Valider tous les fichiers du groupe (in-place sauf option de rangement active)
         kept_items = []
         for rel in in_queue:
             ov     = find_overlay(rel)
@@ -2160,30 +2271,23 @@ def api_trim_status():
 
 @app.route("/api/trash_info", methods=["GET"])
 def api_trash_info():
-    """Compte et taille totale des fichiers dans tous les Tri/Supprimées/ des sources actives."""
+    """Compte et taille totale des fichiers dans le dossier unique « À supprimer »."""
     if not _is_configured():
         return jsonify({"count": 0, "size_bytes": 0, "size_human": "0 B", "trash_dirs": []})
     count = 0
     size  = 0
     dirs  = []
-    for src in _sources():
-        td = src / "Tri" / "Supprimées"
-        if not td.exists():
-            continue
-        dir_count = 0
-        dir_size  = 0
+    td = _trash_root()
+    if td.exists():
         for f in td.rglob("*"):
             if f.is_file():
-                count     += 1
-                dir_count += 1
+                count += 1
                 try:
-                    sz = f.stat().st_size
-                    size     += sz
-                    dir_size += sz
+                    size += f.stat().st_size
                 except Exception:
                     pass
-        if dir_count > 0:
-            dirs.append({"path": str(td), "count": dir_count, "size_bytes": dir_size})
+        if count > 0:
+            dirs.append({"path": str(td), "count": count, "size_bytes": size})
 
     def _human(b):
         for unit in ("B", "KB", "MB", "GB"):
@@ -2196,7 +2300,7 @@ def api_trash_info():
 
 @app.route("/api/empty_trash", methods=["POST"])
 def api_empty_trash():
-    """Envoie tous les fichiers de Tri/Supprimées/ à la Corbeille macOS (réversible)."""
+    """Envoie le contenu du dossier « À supprimer » à la Corbeille macOS (réversible)."""
     if not _is_configured():
         return jsonify({"ok": False, "error": "session non configurée"}), 400
     try:
@@ -2206,10 +2310,8 @@ def api_empty_trash():
 
     moved  = 0
     failed = []
-    for src in _sources():
-        td = src / "Tri" / "Supprimées"
-        if not td.exists():
-            continue
+    td = _trash_root()
+    if td.exists():
         for f in list(td.rglob("*")):
             if not f.is_file():
                 continue
@@ -2253,14 +2355,15 @@ def _collect_convertible_files():
     if not _is_configured():
         return []
     files = []
-    skip_dirs = {"Tri", "_a_supprimer"}
+    skip_dirs = {"Tri", "_a_supprimer", TRASH_FOLDER_NAME}
     for src in _sources():
         if not src.exists():
             continue
         for f in src.rglob("*"):
             if not f.is_file():
                 continue
-            if f.suffix.lower() not in MEDIA_EXT:
+            # Compression réservée aux images/vidéos — jamais les docs/audio/archives.
+            if f.suffix.lower() not in CONVERTIBLE_EXT:
                 continue
             if f.name.startswith(".") or f.name.endswith("-overlay.png"):
                 continue
@@ -2268,7 +2371,7 @@ def _collect_convertible_files():
                 rel_parts = f.relative_to(src).parts
             except Exception:
                 continue
-            if any(part in skip_dirs for part in rel_parts):
+            if _parts_excluded(rel_parts, skip_dirs):
                 continue
             files.append(f)
     return files
@@ -2538,8 +2641,12 @@ def serve_media(entry):
 
     Le '::' peut arriver URL-encodé en %3A%3A (Flask le décode automatiquement).
     Pour la rétrocompat single-source, '<rel>' sans '::' est aussi accepté.
+    Les fichiers texte sont servis en text/plain pour s'afficher dans l'aperçu.
     """
-    return send_file(str(_entry_path(entry)))
+    p = _entry_path(entry)
+    if p.suffix.lower() in TEXT_EXT:
+        return send_file(str(p), mimetype="text/plain")
+    return send_file(str(p))
 
 
 _PREVIEW_DIR = _NS_DIR / "previews"
@@ -2635,6 +2742,7 @@ def api_gallery():
             "url":         f"/media/{entry}",
             "preview_url": None if _is_web_renderable(rel_only) else f"/preview/{entry}",
             "is_video":    Path(rel_only).suffix.lower() in VIDEO_EXT,
+            "kind":        _media_kind(rel_only),
             "size_kb":     round(sz / 1024),
             "size_bytes":  sz,
             "year":        str(dt.year) if dt else "—",
@@ -3406,7 +3514,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="tb-right">
     <div id="triage-filter" class="tf-group" title="Filtrer les médias à trier"></div>
     <button id="btn-gallery" onclick="setTriageMode('gallery')" title="Basculer en mode galerie (tri par lot au clavier)">▦ Galerie</button>
-    <button id="btn-empty-trash" onclick="confirmEmptyTrash()" title="Vider Tri/Supprimées vers la Corbeille macOS">🗑 <span id="empty-trash-label">Vider</span></button>
+    <button id="btn-empty-trash" onclick="confirmEmptyTrash()" title="Vider le dossier « À supprimer » vers la Corbeille macOS">🗑 <span id="empty-trash-label">Vider</span></button>
     <span id="scan-indicator">
       <button id="btn-rescan" onclick="triggerRescan()" title="Relancer l'analyse des doublons pHash">↻</button>
     </span>
@@ -3435,19 +3543,20 @@ PAGE = r"""<!DOCTYPE html>
     </section>
 
     <section class="wc-section">
-      <label>Options de tri</label>
+      <label>Rangement des fichiers gardés (optionnel)</label>
+      <p class="wc-hint">Par défaut, un fichier <b>gardé reste à son emplacement d'origine</b> : seul le tri (garder / supprimer) est appliqué. Active une option ci-dessous pour réorganiser les fichiers gardés à la racine de leur dossier source.</p>
       <div class="wc-opts">
-        <label><input type="checkbox" id="opt-by_year" checked> Grouper par année</label>
+        <label><input type="checkbox" id="opt-by_year"> Ranger par année</label>
         <label><input type="checkbox" id="opt-by_month"> Aussi par mois</label>
-        <label><input type="checkbox" id="opt-split_media"> Séparer images / vidéos</label>
+        <label><input type="checkbox" id="opt-split_media"> Séparer par type (images / vidéos / audio / documents)</label>
         <label><input type="checkbox" id="opt-rename"> Renommer (YYYY-MM-DD_hash.ext)</label>
         <label><input type="checkbox" id="opt-order_largest"> Traiter d'abord les fichiers les plus volumineux</label>
       </div>
     </section>
 
     <div class="wc-preview">
-      <span>Aperçu structure de sortie :</span>
-      <code id="wc-preview-path">&lt;source&gt;/Tri/Gardées/2024/photo.jpg</code>
+      <span>Aperçu du rangement :</span>
+      <code id="wc-preview-path">Les fichiers gardés restent à leur emplacement.</code>
     </div>
 
     <section class="wc-section">
@@ -3999,7 +4108,7 @@ function renderDone() {
     document.getElementById('done-icon').textContent  = '✅';
     document.getElementById('done-title').textContent = 'Tri terminé !';
     document.getElementById('done-msg').textContent   =
-      `${current.total} fichier(s) traité(s) : dossier _a_supprimer prêt à vider.`;
+      `${current.total} fichier(s) traité(s) : dossier « À supprimer » prêt à vider.`;
     sub.textContent = 'De nouveaux médias dans tes dossiers ? Lance une recherche.';
     allBtn.style.display = 'none';
   }
@@ -4027,13 +4136,14 @@ function renderSingle() {
   document.getElementById('overlay-badge').classList.toggle('hidden', !current.overlay_url);
 
   const wrap = document.getElementById('media-wrap');
-  wrap.querySelectorAll('img, video').forEach(e => e.remove());
+  wrap.querySelectorAll('img, video, audio, iframe, .file-card').forEach(e => e.remove());
   wrap.style.display = 'inline-flex';
 
   const ts = '?t=' + Date.now();
+  const viewer = current.viewer || (current.is_video ? 'video' : 'image');
   // Vidéo lisible nativement uniquement si pas de preview_url (mp4/mov/m4v).
   // Sinon (AVI/MKV/RAW…) on affiche l'aperçu JPEG généré côté serveur.
-  if (current.is_video && !current.preview_url) {
+  if (viewer === 'video' && !current.preview_url) {
     const v    = document.createElement('video');
     v.id       = 'main-video';
     v.src      = current.url + ts;
@@ -4048,11 +4158,25 @@ function renderSingle() {
     document.getElementById('vc-prog-fill').style.width = '0';
     document.getElementById('vc-time').textContent      = '0:00 / 0:00';
     document.getElementById('vc-mute').textContent      = '🔊';
-  } else {
+  } else if (viewer === 'image' || current.preview_url) {
     const img = document.createElement('img');
     img.id    = 'main-img'; img.src = (current.preview_url || current.url) + ts;
     img.alt   = current.name || 'Média à trier';
     wrap.insertBefore(img, wrap.firstChild);
+  } else if (viewer === 'pdf' || viewer === 'text') {
+    const f = document.createElement('iframe');
+    f.id = 'main-doc'; f.src = current.url + ts;
+    f.style.cssText = 'width:min(78vw,920px);height:74vh;border:none;border-radius:12px;background:#fff';
+    wrap.insertBefore(f, wrap.firstChild);
+  } else if (viewer === 'audio') {
+    const card = buildFileCard(current);
+    const au   = document.createElement('audio');
+    au.controls = true; au.src = current.url + ts; au.style.cssText = 'margin-top:16px;width:min(80vw,420px)';
+    card.appendChild(au);
+    wrap.insertBefore(card, wrap.firstChild);
+  } else {
+    // document bureautique / archive / autre : grande icône + infos
+    wrap.insertBefore(buildFileCard(current), wrap.firstChild);
   }
 
   if (current.overlay_url) {
@@ -4063,14 +4187,48 @@ function renderSingle() {
     wrap.insertBefore(ov, document.getElementById('overlay-badge'));
   }
 
-  // Contrôle contextuel : rogner (photo) vs découper (vidéo).
-  const cbtn = document.getElementById('btn-crop');
-  if (cbtn) {
-    cbtn.style.display = '';
-    cbtn.innerHTML = current.is_video
-      ? '✂ Découper <span class="key">R</span>'
-      : '✂ Rogner <span class="key">R</span>';
+  // Outils d'édition (pivoter / rogner) : visibles uniquement pour images & vidéos.
+  updateEditButtons();
+}
+
+// Édition (rotate/crop) réservée aux images et vidéos. Centralisé ici car appelé
+// par renderSingle ET par un interval de sécurité (le DOM peut être réinitialisé).
+function _isEditable() {
+  return !!current && !current.done
+    && (current.kind === 'image' || current.kind === 'video')
+    && current.mode !== 'needs_config' && current.mode !== 'trial_limit';
+}
+function updateEditButtons() {
+  const btnCrop = document.getElementById('btn-crop');
+  const btnRot  = document.getElementById('btn-rotate');
+  if (!btnCrop || !btnRot) return;
+  if (!_isEditable()) {
+    btnCrop.style.display = 'none';
+    btnRot.style.display  = 'none';
+    return;
   }
+  btnRot.style.display  = '';
+  btnCrop.style.display = '';
+  btnCrop.innerHTML = current.is_video
+    ? '✂ Découper <span class="key">R</span>'
+    : '✂ Rogner <span class="key">R</span>';
+}
+
+const KIND_ICONS = { audio: '🎵', document: '📄', archive: '🗜️', image: '🖼️', video: '🎬', other: '📎' };
+function buildFileCard(item) {
+  const card = document.createElement('div');
+  card.className = 'file-card';
+  card.style.cssText = 'display:flex;flex-direction:column;align-items:center;justify-content:center;'
+    + 'gap:8px;padding:48px 40px;min-width:min(70vw,420px);min-height:46vh;'
+    + 'background:var(--surface,#1a1a1a);border:1px solid var(--border,#2a2a2a);border-radius:16px';
+  const ext = (item.name || '').split('.').pop().toUpperCase();
+  const kb  = item.size_kb || 0;
+  const sizeStr = kb >= 1024 ? (kb / 1024).toFixed(1) + ' Mo' : kb + ' Ko';
+  card.innerHTML =
+    `<div style="font-size:84px;line-height:1">${KIND_ICONS[item.kind] || '📎'}</div>
+     <div style="font-weight:600;color:var(--txt-1,#eee);max-width:80vw;text-align:center;word-break:break-word">${item.name || ''}</div>
+     <div style="font-size:12px;color:var(--txt-3,#888)">${ext} · ${sizeStr}${item.year && item.year !== '—' ? ' · ' + item.year : ''}</div>`;
+  return card;
 }
 
 /* ─── Group mode render ─────────────────────────────────── */
@@ -4428,14 +4586,20 @@ async function activateLicense() {
 }
 
 /* ─── Welcome view (v0.2.0) ─────────────────────────────── */
-let wcState = { sources: [], options: { by_year: true, by_month: false, split_media: false, rename: false, order: 'default' } };
+let wcState = { sources: [], options: { by_year: false, by_month: false, split_media: false, rename: false, order: 'default' } };
 
 function wcUpdatePreview() {
-  const parts = ['<source>', 'Tri', 'Gardées'];
-  if (wcState.options.split_media) parts.push('images');
-  if (wcState.options.by_year)     parts.push('2024');
-  if (wcState.options.by_month)    parts.push('05');
-  parts.push(wcState.options.rename ? '2024-05-22_a1b2c3d4.jpg' : 'photo.jpg');
+  const o = wcState.options;
+  const organizing = o.split_media || o.by_year || o.by_month || o.rename;
+  if (!organizing) {
+    document.getElementById('wc-preview-path').textContent = 'Les fichiers gardés restent à leur emplacement.';
+    return;
+  }
+  const parts = ['<source>'];
+  if (o.split_media) parts.push('images');
+  if (o.by_year)     parts.push('2024');
+  if (o.by_month)    parts.push('05');
+  parts.push(o.rename ? '2024-05-22_a1b2c3d4.jpg' : 'photo.jpg');
   document.getElementById('wc-preview-path').textContent = parts.join('/');
 }
 
@@ -4483,11 +4647,14 @@ async function loadGallery(sort) {
     d.items.forEach(it => {
       const cell = document.createElement('div');
       cell.style.cssText = 'background:#141414;border:1px solid #262626;border-radius:8px;overflow:hidden;display:flex;flex-direction:column';
-      const thumb = (it.preview_url || it.url);
       const sizeStr = it.size_kb >= 1024 ? (it.size_kb / 1024).toFixed(1) + ' Mo' : it.size_kb + ' Ko';
+      const icons = { audio: '🎵', document: '📄', archive: '🗜️', image: '🖼️', video: '🎬', other: '📎' };
+      const visual = (it.kind === 'image' || it.kind === 'video')
+        ? `<img loading="lazy" src="${it.preview_url || it.url}" style="width:100%;height:100%;object-fit:cover">`
+        : `<span style="font-size:46px">${icons[it.kind] || '📎'}</span>`;
       cell.innerHTML =
         `<div style="aspect-ratio:1;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden">
-           <img loading="lazy" src="${thumb}" style="width:100%;height:100%;object-fit:cover">
+           ${visual}
          </div>
          <div style="padding:6px 8px;font-size:11px;color:#bbb;display:flex;justify-content:space-between;gap:6px">
            <span style="font-weight:600;color:#fb923c">${sizeStr}</span><span>${it.year}</span>
@@ -5350,25 +5517,13 @@ document.addEventListener('keydown', (e) => {
   if (document.getElementById('crop-overlay').classList.contains('show')) return;
   if (document.getElementById('trim-overlay').classList.contains('show')) return;
 
-  if (e.key === 't' || e.key === 'T') { transformRotate(); e.preventDefault(); return; }
-  if (e.key === 'r' || e.key === 'R') { openCropOrTrim(); e.preventDefault(); return; }
+  // Rotation / rognage : uniquement sur images & vidéos (pas PDF/audio/doc/archive).
+  if ((e.key === 't' || e.key === 'T') && _isEditable()) { transformRotate(); e.preventDefault(); return; }
+  if ((e.key === 'r' || e.key === 'R') && _isEditable()) { openCropOrTrim(); e.preventDefault(); return; }
 });
 
-/* Mise à jour conditionnelle du bouton crop/trim selon le type */
-(function updateCropButtonVisibility() {
-  const obs = setInterval(() => {
-    const btn = document.getElementById('btn-crop');
-    if (!btn) return;
-    if (!current || current.mode === 'needs_config' || current.mode === 'trial_limit' || current.done) {
-      btn.style.display = 'none';
-      return;
-    }
-    btn.style.display = '';
-    btn.innerHTML = current.is_video
-      ? '✂ Découper <span class="key">R</span>'
-      : '✂ Rogner <span class="key">R</span>';
-  }, 800);
-})();
+/* Filet de sécurité : garde la visibilité des outils d'édition cohérente avec le type courant */
+setInterval(() => { updateEditButtons(); }, 800);
 
 /* ─── Auto-update (v0.5.0+) ─────────────────────────────── */
 
